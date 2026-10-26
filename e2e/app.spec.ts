@@ -189,7 +189,7 @@ test('sample data loads, every page renders without errors, sample can be remove
   await page.getByRole('button', { name: 'Load sample data' }).click()
   await page.getByRole('dialog').getByRole('button', { name: 'Load sample data' }).click()
   await expect(page.getByText('Sample data loaded')).toBeVisible()
-  for (const [route, heading] of [['/', 'Dashboard'], ['/income', 'Income'], ['/expenses', 'Expenses'], ['/accounts', 'Accounts'], ['/budgets', 'Budgets'], ['/loans', 'Loans & EMI'], ['/goals', 'Savings & goals'], ['/reports', 'Reports'], ['/settings', 'Settings']] as const) {
+  for (const [route, heading] of [['/', 'Dashboard'], ['/income', 'Income'], ['/expenses', 'Expenses'], ['/accounts', 'Accounts'], ['/budgets', 'Budgets'], ['/recurring', 'Recurring'], ['/loans', 'Loans & EMI'], ['/goals', 'Savings & goals'], ['/reports', 'Reports'], ['/settings', 'Settings']] as const) {
     await page.goto(`/#${route}`)
     await expect(page.getByRole('heading', { name: heading, level: 1 })).toBeVisible()
     await page.waitForTimeout(250)
@@ -201,5 +201,55 @@ test('sample data loads, every page renders without errors, sample can be remove
   await page.goto('/#/accounts')
   await expect(page.getByRole('article', { name: 'Main Bank' })).toBeVisible()
   await expect(page.getByRole('article', { name: /Sample/ })).toHaveCount(0)
+  expect(problems).toEqual([])
+})
+
+test('recurring: overdue item is recorded with one click, then stopped', async ({ page }) => {
+  const problems = watchErrors(page)
+  const d = new Date()
+  const twoBack = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() - 2, 15))
+  const date = twoBack.toISOString().slice(0, 10)
+
+  await page.goto('/#/expenses')
+  await page.getByRole('button', { name: 'Add transaction' }).first().click()
+  const dlg = page.getByRole('dialog', { name: 'Add transaction' })
+  await dlg.getByLabel('Amount (₹)').fill('799')
+  await dlg.getByLabel('Date').fill(date)
+  await dlg.getByLabel('Category').selectOption({ label: 'Subscriptions' })
+  await dlg.getByLabel('Merchant').fill('Gym Club')
+  await dlg.getByLabel('Repeats').selectOption('monthly')
+  await dlg.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(dlg).toBeHidden()
+
+  await page.goto('/#/recurring')
+  const row = page.getByTestId('recurring-row').filter({ hasText: 'Gym Club' })
+  await expect(row).toContainText('overdue')
+  await expect(row).toContainText('1 recorded')
+  await expect(row).toContainText('₹799.00')
+
+  await row.getByRole('button', { name: /^Record Gym Club/ }).click()
+  await expect(page.getByText(/Expense recorded: Gym Club/)).toBeVisible()
+  await expect(row).toContainText('2 recorded')
+
+  // survives a reload (it is stored data, not UI state)
+  await page.reload()
+  await expect(page.getByTestId('recurring-row').filter({ hasText: 'Gym Club' })).toContainText('2 recorded')
+
+  // stopping needs confirmation; Cancel keeps it
+  await row.getByRole('button', { name: 'Stop recurring Gym Club' }).click()
+  const c = page.getByRole('dialog', { name: 'Stop this recurring item?' })
+  await c.getByRole('button', { name: 'Cancel' }).click()
+  await expect(row).toBeVisible()
+  await row.getByRole('button', { name: 'Stop recurring Gym Club' }).click()
+  await page.getByRole('dialog', { name: 'Stop this recurring item?' }).getByRole('button', { name: 'Stop recurring' }).click()
+  await expect(page.getByTestId('recurring-row').filter({ hasText: 'Gym Club' })).toHaveCount(0)
+
+  // the two recorded transactions remain
+  await page.goto('/#/expenses')
+  await page.getByLabel('Search Expenses').fill('Gym Club')
+  await page.getByRole('button', { name: 'Custom' }).click()
+  await page.getByLabel('From date').fill('2000-01-01')
+  await page.getByLabel('To date').fill('2100-01-01')
+  await expect(page.getByTestId('tx-row')).toHaveCount(2)
   expect(problems).toEqual([])
 })

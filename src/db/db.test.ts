@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 import { db } from './db'
-import { accounts, budgets, categories, clearAllData, ensureSeed, goals, loans, transactions, RepoError } from './repo'
+import { accounts, budgets, recurring, categories, clearAllData, ensureSeed, goals, loans, transactions, RepoError } from './repo'
 import { applyRestore, buildBackup, exportBackupJson, parseBackup, previewRestore } from './backup'
 import { previewCsv, transactionsToCsv } from './csv'
 import { applyCsvImport } from './importCsv'
@@ -88,6 +88,44 @@ describe('persistence & repositories', () => {
     const g = await goals.create({ name: 'Trip', kind: 'purchase', target: 100000, saved: 20000 })
     await goals.update(g.id, { saved: 30000 })
     expect((await db.goals.get(g.id))?.saved).toBe(30000)
+  })
+})
+
+describe('recurring transactions', () => {
+  async function series() {
+    const a = await accounts.create({ name: 'Bank', type: 'savings', openingBalance: 100000 })
+    const base = { type: 'expense' as const, amount: 20000, accountId: a.id, categoryId: food, paymentMethod: 'upi' as const, merchant: 'Gym', recurring: 'monthly' as const }
+    const t1 = await transactions.create({ ...base, date: '2025-01-31' })
+    const t2 = await transactions.create({ ...base, date: '2025-02-28' })
+    return { a, t1, t2 }
+  }
+  it('records the next occurrence from the latest entry, once per period', async () => {
+    const { a, t1 } = await series()
+    const n = await recurring.recordNext(t1.id, '2025-03-31') // passing an OLD entry still continues from the latest
+    expect(n).toMatchObject({ date: '2025-03-31', amount: 20000, merchant: 'Gym', recurring: 'monthly', accountId: a.id })
+    const n2 = await recurring.recordNext(t1.id, '2025-04-30')
+    expect(n2.date).toBe('2025-04-30') // 31st clamps to 30 in April, no permanent drift
+    expect(await db.transactions.count()).toBe(4)
+    expect(accountBalance((await db.accounts.get(a.id))!, await db.transactions.toArray())).toBe(100000 - 4 * 20000)
+  })
+  it('refuses to record something that is not due yet', async () => {
+    const { t2 } = await series()
+    await expect(recurring.recordNext(t2.id, '2025-03-30')).rejects.toThrow(/Not due yet/)
+    expect(await db.transactions.count()).toBe(2)
+  })
+  it('stop ends the whole series without touching entries or balances', async () => {
+    const { t1 } = await series()
+    expect(await recurring.stop(t1.id)).toBe(2)
+    const rows = await db.transactions.toArray()
+    expect(rows).toHaveLength(2)
+    expect(rows.every((r) => r.recurring === undefined)).toBe(true)
+    await expect(recurring.recordNext(t1.id, '2026-01-01')).rejects.toThrow(/no longer part/)
+    expect(await recurring.stop(t1.id)).toBe(0)
+  })
+  it('does not post into an account that was deleted', async () => {
+    const { t2 } = await series()
+    await db.accounts.clear()
+    await expect(recurring.recordNext(t2.id, '2025-12-31')).rejects.toThrow(/no longer exists/)
   })
 })
 

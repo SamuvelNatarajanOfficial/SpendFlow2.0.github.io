@@ -11,6 +11,7 @@ import {
 } from './schemas'
 import type { Account, Budget, Category, Goal, Loan, LoanPayment, Settings, Transaction } from '@/types'
 import { splitPayment } from '@/lib/calc/loan'
+import { anchorDayOf, isSeriesMember, nextOccurrence, seriesKey } from '@/lib/calc/ledger'
 
 export class RepoError extends Error {}
 
@@ -188,6 +189,54 @@ export const transactions = {
       await db.transactions.bulkAdd(recs)
     })
     return recs.length
+  },
+}
+
+// ---------- recurring series ----------
+
+export const recurring = {
+  /**
+   * Posts the next occurrence of a recurring series as a real transaction, dated on its due date.
+   * Always continues from the series' LATEST entry (whichever entry was passed), so it can never post a
+   * duplicate of an existing date, and refuses to post anything not yet due as of `today`.
+   */
+  async recordNext(sourceId: string, today: string): Promise<Transaction> {
+    return db.transaction('rw', [db.transactions, db.accounts, db.categories], async () => {
+      const src = await db.transactions.get(sourceId)
+      if (!src || !isSeriesMember(src)) throw new RepoError('This entry is no longer part of a recurring series')
+      const key = seriesKey(src)
+      const members = await db.transactions.filter((t) => isSeriesMember(t) && seriesKey(t) === key).toArray()
+      const latest = members.reduce((a, b) => (b.date > a.date ? b : a))
+      const date = nextOccurrence(latest.date, latest.recurring!, anchorDayOf(members.map((m) => m.date)))
+      if (date > today) throw new RepoError(`Not due yet: next occurrence is ${date}`)
+      const rec = validate(
+        transactionSchema,
+        make<Transaction>({
+          type: latest.type, amount: latest.amount, date, accountId: latest.accountId, categoryId: latest.categoryId, paymentMethod: latest.paymentMethod,
+          merchant: latest.merchant, notes: latest.notes, essential: latest.essential, recurring: latest.recurring,
+        }),
+      ) as Transaction
+      if (latest.isSample) rec.isSample = true
+      await assertTxRefs(rec)
+      await db.transactions.add(rec)
+      return rec
+    })
+  },
+
+  /** Ends a series: clears the recurring flag on every entry of it. Entries themselves (and balances) are untouched. */
+  async stop(sourceId: string): Promise<number> {
+    return db.transaction('rw', db.transactions, async () => {
+      const src = await db.transactions.get(sourceId)
+      if (!src || !isSeriesMember(src)) return 0
+      const key = seriesKey(src)
+      const members = await db.transactions.filter((t) => isSeriesMember(t) && seriesKey(t) === key).toArray()
+      const now = nowIso()
+      await db.transactions.bulkPut(members.map((t) => {
+        const { recurring: _drop, ...rest } = t
+        return { ...rest, updatedAt: now }
+      }))
+      return members.length
+    })
   },
 }
 

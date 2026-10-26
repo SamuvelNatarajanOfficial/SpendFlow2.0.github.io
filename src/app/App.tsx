@@ -2,7 +2,7 @@ import { lazy, Suspense, useState } from 'react'
 import { HashRouter, NavLink, Navigate, Route, Routes, Link } from 'react-router-dom'
 import { useRegisterSW } from 'virtual:pwa-register/react'
 import {
-  BarChart3, Home, LayoutGrid, Landmark, Moon, PiggyBank, Plus, Settings as SettingsIcon, Sun, Target, TrendingDown, TrendingUp, Wallet, X,
+  BarChart3, Home, LayoutGrid, Landmark, Moon, PiggyBank, Plus, Repeat, Settings as SettingsIcon, Sun, Target, TrendingDown, TrendingUp, Wallet, X,
 } from 'lucide-react'
 import clsx from 'clsx'
 import { DataProvider, useData } from './data'
@@ -18,6 +18,7 @@ const LoansPage = lazy(() => import('@/features/LoansPage'))
 const LoanDetail = lazy(() => import('@/features/LoanDetail'))
 const GoalsPage = lazy(() => import('@/features/GoalsPage'))
 const ReportsPage = lazy(() => import('@/features/ReportsPage'))
+const RecurringPage = lazy(() => import('@/features/RecurringPage'))
 const SettingsPage = lazy(() => import('@/features/SettingsPage'))
 
 const NAV = [
@@ -26,6 +27,7 @@ const NAV = [
   { to: '/expenses', label: 'Expenses', icon: TrendingDown },
   { to: '/accounts', label: 'Accounts', icon: Wallet },
   { to: '/budgets', label: 'Budgets', icon: PiggyBank },
+  { to: '/recurring', label: 'Recurring', icon: Repeat },
   { to: '/loans', label: 'Loans & EMI', icon: Landmark },
   { to: '/goals', label: 'Goals', icon: Target },
   { to: '/reports', label: 'Reports', icon: BarChart3 },
@@ -161,6 +163,7 @@ function Shell() {
             <Route path="/expenses" element={<TransactionsPage type="expense" />} />
             <Route path="/accounts" element={<AccountsPage />} />
             <Route path="/budgets" element={<BudgetsPage />} />
+            <Route path="/recurring" element={<RecurringPage />} />
             <Route path="/loans" element={<LoansPage />} />
             <Route path="/loans/:id" element={<LoanDetail />} />
             <Route path="/goals" element={<GoalsPage />} />

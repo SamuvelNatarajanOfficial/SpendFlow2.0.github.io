@@ -1,4 +1,4 @@
-import { useMemo } from 'react'
+import { useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { ArrowDownRight, ArrowUpRight, CalendarClock, Landmark, Plus, Wallet } from 'lucide-react'
 import { useData } from '@/app/data'
@@ -7,13 +7,27 @@ import { RangeFilter, useRange } from '@/components/RangeFilter'
 import { BalanceTrendChart, CategoryDonut, IncomeExpenseChart } from '@/components/charts'
 import { TransactionList } from '@/components/TransactionList'
 import { Badge, EmptyState, PageHeader, ProgressBar, Section, Stat } from '@/components/ui'
-import { expenseByCategory, filterByRange, savingsRate, sortTx, sumExpense, sumIncome, totalBalance, upcomingRecurring } from '@/lib/calc/ledger'
+import { expenseByCategory, filterByRange, savingsRate, sortTx, sumExpense, sumIncome, totalBalance, upcomingRecurring, type RecurringSeries } from '@/lib/calc/ledger'
 import { budgetTotals, monthBudgetStatuses } from '@/lib/calc/budget'
 import { nextEmiDue, summariseLoans } from '@/lib/calc/loan'
 import { goalProgress } from '@/lib/calc/goals'
 import { loanBalanceTrend, monthlySeries } from '@/lib/calc/reports'
 import { addMonthKey, diffDays, formatDate, formatMonth, monthOf, monthsInRange, monthStart } from '@/lib/dates'
 import { formatINR } from '@/lib/money'
+import { useRecurringActions } from '@/components/useRecurringActions'
+import { PaymentModal } from './loanForms'
+import type { Loan } from '@/types'
+
+interface UpcomingItem {
+  key: string
+  title: string
+  amount: number
+  dueDate: string
+  kind: 'emi' | 'bill' | 'income'
+  overdue: boolean
+  loan?: Loan
+  series?: RecurringSeries
+}
 
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`
 
@@ -41,12 +55,14 @@ export default function Dashboard() {
   const bt = budgetTotals(budgets)
 
   const loanSum = summariseLoans(d.loans)
-  const upcoming = useMemo(() => {
+  const { record, busy } = useRecurringActions()
+  const [payLoan, setPayLoan] = useState<Loan | null>(null)
+  const upcoming = useMemo<UpcomingItem[]>(() => {
     const emis = d.loans
       .map((l) => ({ l, due: nextEmiDue(l, d.loanPayments, d.today) }))
       .filter((x) => x.due && diffDays(d.today, x.due.dueDate) <= 30)
-      .map((x) => ({ key: `loan-${x.l.id}`, title: `${x.l.name} EMI`, amount: x.l.emi, dueDate: x.due!.dueDate, kind: 'emi' as const, overdue: x.due!.overdue }))
-    const bills = upcomingRecurring(d.transactions, d.catMap, d.today).map((b) => ({ ...b, kind: b.type === 'income' ? ('income' as const) : ('bill' as const), overdue: b.dueDate < d.today }))
+      .map((x) => ({ key: `loan-${x.l.id}`, title: `${x.l.name} EMI`, amount: x.l.emi, dueDate: x.due!.dueDate, kind: 'emi' as const, overdue: x.due!.overdue, loan: x.l }))
+    const bills = upcomingRecurring(d.transactions, d.catMap, d.today).map((b) => ({ ...b, kind: b.type === 'income' ? ('income' as const) : ('bill' as const), overdue: b.dueDate < d.today, series: b }))
     return [...emis, ...bills].sort((a, b) => a.dueDate.localeCompare(b.dueDate))
   }, [d.loans, d.loanPayments, d.transactions, d.catMap, d.today])
 
@@ -138,7 +154,15 @@ export default function Dashboard() {
                     <p className="truncate font-semibold">{u.title}</p>
                     <p className="text-xs text-subtle">{formatDate(u.dueDate)} {u.overdue ? <Badge tone="neg">Overdue</Badge> : <span>· in {Math.max(0, diffDays(d.today, u.dueDate))} days</span>}</p>
                   </div>
-                  <span className={`num font-bold ${u.kind === 'income' ? 'text-pos' : ''}`}>{u.kind === 'income' ? '+' : ''}{formatINR(u.amount)}</span>
+                  <div className="flex shrink-0 items-center gap-2">
+                    <span className={`num font-bold ${u.kind === 'income' ? 'text-pos' : ''}`}>{u.kind === 'income' ? '+' : ''}{formatINR(u.amount)}</span>
+                    {u.dueDate <= d.today && u.series && (
+                      <button type="button" className="btn-primary !min-h-[32px] !px-3 text-xs" disabled={busy !== null} onClick={() => record(u.series!)} aria-label={`Record ${u.title}`}>Record</button>
+                    )}
+                    {u.dueDate <= d.today && u.loan && (
+                      <button type="button" className="btn-primary !min-h-[32px] !px-3 text-xs" onClick={() => setPayLoan(u.loan!)} aria-label={`Record EMI for ${u.loan.name}`}>Record</button>
+                    )}
+                  </div>
                 </li>
               ))}
             </ul>
@@ -179,6 +203,7 @@ export default function Dashboard() {
           <BalanceTrendChart data={debtTrend} label="Total outstanding debt" />
         </Section>
       )}
+      {payLoan && <PaymentModal open onClose={() => setPayLoan(null)} loan={payLoan} kind="emi" />}
     </div>
   )
 }

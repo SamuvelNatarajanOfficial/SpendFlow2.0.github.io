@@ -34,7 +34,6 @@ jobs:
       - run: npm run build
       # relative base ('./') works for any repo name; VITE_BASE can override it
       - run: cp dist/index.html dist/404.html
-      - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
           path: dist
