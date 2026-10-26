@@ -1,8 +1,9 @@
 import { expect, test } from '@playwright/test'
-import { addAccount, addTx, watchErrors } from './helpers'
+import { addAccount, addTx, setupVault, unlock, watchErrors } from './helpers'
 
 test('narrow mobile: no horizontal scroll, bottom nav and add button work', async ({ page }) => {
   const problems = watchErrors(page)
+  await setupVault(page)
   await addAccount(page, 'Phone Wallet', '500')
   await addTx(page, { type: 'expense', amount: '120', category: 'Food & Dining', merchant: 'Chai' })
 
@@ -20,7 +21,8 @@ test('narrow mobile: no horizontal scroll, bottom nav and add button work', asyn
   expect(problems).toEqual([])
 })
 
-test('app works offline after first load (service worker)', async ({ page, context }) => {
+test('app works offline after first load (service worker); data stays encrypted and unlockable offline', async ({ page, context }) => {
+  await setupVault(page)
   await addAccount(page, 'Phone Wallet', '500')
   await addTx(page, { type: 'expense', amount: '120', category: 'Food & Dining', merchant: 'Chai' })
   await page.goto('/')
@@ -31,6 +33,7 @@ test('app works offline after first load (service worker)', async ({ page, conte
   await page.waitForTimeout(500)
   await context.setOffline(true)
   await page.reload()
+  await unlock(page) // offline reload shows the lock screen first
   await expect(page.getByRole('heading', { name: 'Dashboard', level: 1 })).toBeVisible()
   await page.goto('/#/expenses')
   await expect(page.getByTestId('tx-row').filter({ hasText: 'Chai' })).toBeVisible() // data persisted locally

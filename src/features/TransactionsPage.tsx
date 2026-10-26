@@ -6,7 +6,8 @@ import { RangeFilter, useRange } from '@/components/RangeFilter'
 import { TransactionList, describeTx } from '@/components/TransactionList'
 import { EmptyState, PageHeader, Stat, useConfirm, useToast } from '@/components/ui'
 import { transactions as repo } from '@/db/repo'
-import { downloadText, transactionsToCsv } from '@/db/csv'
+import { transactionsToCsv } from '@/db/csv'
+import { usePlainExport } from '@/components/usePlainExport'
 import { filterByRange, searchTx, sortTx } from '@/lib/calc/ledger'
 import { formatINR } from '@/lib/money'
 import { formatDate } from '@/lib/dates'
@@ -19,6 +20,7 @@ export default function TransactionsPage({ type }: { type: 'income' | 'expense' 
   const { openTransaction } = useUI()
   const confirm = useConfirm()
   const toast = useToast()
+  const plainExport = usePlainExport()
   const r = useRange('this-month')
   const [q, setQ] = useState('')
   const [categoryId, setCategoryId] = useState('')
@@ -60,7 +62,7 @@ export default function TransactionsPage({ type }: { type: 'income' | 'expense' 
         subtitle={isIncome ? 'Salary, freelance, bonuses, refunds and other earnings' : 'Everything you spend, by category'}
         actions={
           <>
-            <button type="button" className="btn-secondary" disabled={filtered.length === 0} onClick={() => downloadText(`spendflow-${type}.csv`, transactionsToCsv(filtered, d.accounts, d.categories), 'text/csv')}>
+            <button type="button" className="btn-secondary" disabled={filtered.length === 0} onClick={() => plainExport(`spendflow-${type}.csv`, transactionsToCsv(filtered, d.accounts, d.categories))}>
               <Download size={16} /> CSV
             </button>
             <button type="button" className="btn-primary" onClick={() => openTransaction({ type })}><Plus size={16} /> Add {isIncome ? 'income' : 'expense'}</button>

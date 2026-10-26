@@ -1,4 +1,4 @@
-import { db } from './db'
+import { vault } from '@/vault/store'
 import { categories, transactions } from './repo'
 import { categoryColorFor, type ImportPreview } from './csv'
 
@@ -7,7 +7,7 @@ export async function applyCsvImport(preview: ImportPreview, includeDuplicates: 
   const rows = preview.rows.filter((r) => r.tx && (r.status === 'ok' || (includeDuplicates && r.status === 'duplicate')))
   let created = 0
   const idByKey = new Map<string, string>()
-  const all = await db.categories.toArray()
+  const all = vault.all('categories')
   for (const r of rows) {
     if (!r.newCategory) continue
     const key = `${r.newCategory.kind}|${r.newCategory.name.toLowerCase()}`

@@ -1,5 +1,5 @@
-import { db } from './db'
-import { accounts, budgets, goals, loans, transactions, updateSettings, ALL_TABLES } from './repo'
+import { vault } from '@/vault/store'
+import { accounts, budgets, goals, loans, transactions, updateSettings } from './repo'
 import { addMonths, monthOf, parts, makeDate } from '@/lib/dates'
 import { builtInCategoryId } from './defaults'
 import type { PaymentMethod } from '@/types'
@@ -77,9 +77,9 @@ export async function loadSampleData(today: string): Promise<void> {
 }
 
 export async function countSample(): Promise<number> {
-  let n = 0
-  for (const t of ALL_TABLES()) if (t.name !== 'settings') n += await t.filter((r: { isSample?: boolean }) => !!r.isSample).count()
-  return n
+  const d = vault.snapshot()
+  const flagged = (rs: { isSample?: boolean }[]) => rs.filter((r) => r.isSample).length
+  return flagged(d.accounts) + flagged(d.transactions) + flagged(d.budgets) + flagged(d.loans) + flagged(d.loanPayments) + flagged(d.goals)
 }
 
 /**
@@ -87,30 +87,30 @@ export async function countSample(): Promise<number> {
  * records attached is kept (and un-flagged) so real data is never orphaned or deleted.
  */
 export async function removeSampleData(): Promise<void> {
-  await db.transaction('rw', ALL_TABLES(), async () => {
-    const realTx = await db.transactions.filter((t) => !t.isSample).toArray()
-    const realPays = await db.loanPayments.filter((p) => !p.isSample).toArray()
+  await vault.write((w) => {
+    const realTx = w.filter('transactions', (t) => !t.isSample)
+    const realPays = w.filter('loanPayments', (p) => !p.isSample)
     const keepAccounts = new Set<string>()
     for (const t of realTx) {
       keepAccounts.add(t.accountId)
       if (t.toAccountId) keepAccounts.add(t.toAccountId)
     }
-    const sampleLoans = await db.loans.filter((l) => !!l.isSample).toArray()
+    const sampleLoans = w.filter('loans', (l) => !!l.isSample)
     const keepLoans = new Set(realPays.map((p) => p.loanId))
     for (const l of sampleLoans) if (l.accountId && keepAccounts.has(l.accountId)) keepAccounts.add(l.accountId)
     for (const l of sampleLoans) if (keepLoans.has(l.id) && l.accountId) keepAccounts.add(l.accountId)
 
-    await db.transactions.filter((t) => !!t.isSample).delete()
-    await db.loanPayments.filter((p) => !!p.isSample).delete()
-    await db.budgets.filter((b) => !!b.isSample).delete()
-    await db.goals.filter((g) => !!g.isSample).delete()
+    for (const t of w.filter('transactions', (x) => !!x.isSample)) w.delete('transactions', t.id)
+    for (const p of w.filter('loanPayments', (x) => !!x.isSample)) w.delete('loanPayments', p.id)
+    for (const b of w.filter('budgets', (x) => !!x.isSample)) w.delete('budgets', b.id)
+    for (const g of w.filter('goals', (x) => !!x.isSample)) w.delete('goals', g.id)
     for (const l of sampleLoans) {
-      if (keepLoans.has(l.id)) await db.loans.put({ ...l, isSample: false })
-      else await db.loans.delete(l.id)
+      if (keepLoans.has(l.id)) w.put('loans', { ...l, isSample: false })
+      else w.delete('loans', l.id)
     }
-    for (const a of await db.accounts.filter((x) => !!x.isSample).toArray()) {
-      if (keepAccounts.has(a.id)) await db.accounts.put({ ...a, isSample: false })
-      else await db.accounts.delete(a.id)
+    for (const a of w.filter('accounts', (x) => !!x.isSample)) {
+      if (keepAccounts.has(a.id)) w.put('accounts', { ...a, isSample: false })
+      else w.delete('accounts', a.id)
     }
   })
   await updateSettings({ sampleLoaded: false })

@@ -1,47 +1,56 @@
-import { db } from './db'
-import { ALL_TABLES, ensureSeed, getSettings, updateSettings } from './repo'
+import { vault } from '@/vault/store'
+import { decryptBackup, encryptBackup, inspectBackup, MAX_BACKUP_BYTES } from '@/vault/backupFile'
+import type { BackupEnvelope } from '@/vault/format'
+import { assessPassword } from '@/vault/password'
+import { updateSettings } from './repo'
 import { BACKUP_APP, BACKUP_SCHEMA_VERSION, backupSchema, type Backup } from './schemas'
 
 export type RestoreMode = 'merge' | 'replace'
 export const TABLE_KEYS = ['accounts', 'transactions', 'categories', 'budgets', 'loans', 'loanPayments', 'goals'] as const
 export type TableKey = (typeof TABLE_KEYS)[number]
 
-export async function buildBackup(): Promise<Backup> {
-  const [accounts, transactions, categories, budgets, loans, loanPayments, goals, settings] = await Promise.all([
-    db.accounts.toArray(), db.transactions.toArray(), db.categories.toArray(), db.budgets.toArray(),
-    db.loans.toArray(), db.loanPayments.toArray(), db.goals.toArray(), getSettings(),
-  ])
+/** The plaintext payload that gets encrypted into a backup file (never written to disk unencrypted). */
+export function buildBackup(): Backup {
+  const d = vault.snapshot()
   return {
     app: BACKUP_APP,
     schemaVersion: BACKUP_SCHEMA_VERSION,
     exportedAt: new Date().toISOString(),
-    data: { accounts, transactions, categories, budgets, loans, loanPayments, goals, settings },
+    data: {
+      accounts: d.accounts, transactions: d.transactions, categories: d.categories, budgets: d.budgets,
+      loans: d.loans, loanPayments: d.loanPayments, goals: d.goals, settings: d.settings[0],
+    },
   }
 }
 
 export function backupFilename(now = new Date()): string {
-  return `spendflow-backup-${now.toISOString().slice(0, 10)}.json`
+  return `spendflow-backup-${now.toISOString().slice(0, 10)}.sfbackup.json`
 }
 
-/** Serialise a backup. Does NOT mark it as the "last backup": call markBackupDone() once the file was actually saved. */
-export async function exportBackupJson(): Promise<{ json: string; filename: string }> {
-  const b = await buildBackup()
-  return { json: JSON.stringify(b, null, 2), filename: backupFilename() }
+/**
+ * Creates a password-protected backup file. There is intentionally NO unencrypted JSON export.
+ * The backup password is independent of the vault password.
+ */
+export async function exportEncryptedBackup(password: string, opts: { iterations?: number } = {}): Promise<{ text: string; filename: string }> {
+  if (!assessPassword(password).acceptable) throw new Error('Choose a stronger backup password')
+  const text = await encryptBackup(JSON.stringify(buildBackup()), password, opts)
+  return { text, filename: backupFilename() }
 }
 
+/** Call only after the file was actually handed to the user. */
 export async function markBackupDone(): Promise<void> {
   await updateSettings({ lastBackupAt: new Date().toISOString() })
 }
 
 export type ParseResult = { ok: true; backup: Backup; warnings: string[] } | { ok: false; errors: string[] }
 
-/** Validate raw backup text against the versioned schema, plus referential integrity. */
+/** Validates a decrypted (or legacy plaintext) backup payload against the versioned schema, plus referential integrity. */
 export function parseBackup(text: string): ParseResult {
   let raw: unknown
   try {
     raw = JSON.parse(text)
   } catch {
-    return { ok: false, errors: ['This file is not valid JSON.'] }
+    return { ok: false, errors: ['The backup content is not valid JSON.'] }
   }
   if (!raw || typeof raw !== 'object' || (raw as { app?: unknown }).app !== BACKUP_APP) {
     return { ok: false, errors: ['This is not a SpendFlow backup file (missing app marker).'] }
@@ -94,6 +103,53 @@ function integrityErrors(b: Backup): string[] {
   return out
 }
 
+// ---------- reading a backup FILE ----------
+
+export type FileStage =
+  | { ok: true; kind: 'encrypted'; header: BackupEnvelope }
+  | { ok: true; kind: 'legacy-plain' }
+  | { ok: false; message: string }
+
+/** Step 1: public header only. Reveals nothing financial and needs no password. */
+export function inspectBackupFile(text: string): FileStage {
+  const r = inspectBackup(text)
+  return r.ok ? r : { ok: false, message: r.message }
+}
+
+export interface OpenedBackup {
+  backup: Backup
+  warnings: string[]
+  source: 'encrypted' | 'legacy-plain'
+  /** metadata that is only available after successful authentication */
+  counts: Record<TableKey, number>
+}
+export type OpenResult = { ok: true; opened: OpenedBackup } | { ok: false; errors: string[] }
+
+/**
+ * Step 2: authenticate + decrypt + schema-validate. Nothing is written to the vault here; the caller shows a
+ * preview and requires explicit confirmation before `applyRestore`.
+ */
+export async function openBackupFile(text: string, password: string): Promise<OpenResult> {
+  if (text.length > MAX_BACKUP_BYTES) return { ok: false, errors: ['The file is larger than 25 MB.'] }
+  const stage = inspectBackupFile(text)
+  if (!stage.ok) return { ok: false, errors: [stage.message] }
+  let payload: string
+  if (stage.kind === 'legacy-plain') payload = text
+  else {
+    const dec = await decryptBackup(stage.header, password)
+    if (!dec.ok) return { ok: false, errors: [dec.message] }
+    payload = dec.payloadJson
+  }
+  const parsed = parseBackup(payload)
+  if (!parsed.ok) return { ok: false, errors: parsed.errors }
+  const counts = Object.fromEntries(TABLE_KEYS.map((k) => [k, parsed.backup.data[k].length])) as Record<TableKey, number>
+  const warnings = [...parsed.warnings]
+  if (stage.kind === 'legacy-plain') warnings.push('This is an old UNENCRYPTED backup. Its contents will be encrypted when restored.')
+  return { ok: true, opened: { backup: parsed.backup, warnings, source: stage.kind, counts } }
+}
+
+// ---------- applying ----------
+
 export interface RestorePreview {
   mode: RestoreMode
   tables: { key: TableKey; incoming: number; added: number; skipped: number; existing: number }[]
@@ -105,11 +161,8 @@ export interface RestorePreview {
 
 type Rec = { id: string }
 
-async function plan(b: Backup, mode: RestoreMode) {
-  const existing: Record<TableKey, Rec[]> = {
-    accounts: await db.accounts.toArray(), transactions: await db.transactions.toArray(), categories: await db.categories.toArray(),
-    budgets: await db.budgets.toArray(), loans: await db.loans.toArray(), loanPayments: await db.loanPayments.toArray(), goals: await db.goals.toArray(),
-  }
+function plan(b: Backup, mode: RestoreMode) {
+  const existing = Object.fromEntries(TABLE_KEYS.map((k) => [k, vault.all(k) as Rec[]])) as Record<TableKey, Rec[]>
   const toAdd = {} as Record<TableKey, Rec[]>
   for (const k of TABLE_KEYS) {
     const incoming = b.data[k] as Rec[]
@@ -120,7 +173,7 @@ async function plan(b: Backup, mode: RestoreMode) {
     const have = new Set(existing[k].map((r) => r.id))
     let list = incoming.filter((r) => !have.has(r.id))
     if (k === 'budgets') {
-      // unique (category, month): skip incoming budgets that collide with an existing one
+      // a budget is unique per (category, month): skip incoming budgets that collide with an existing one
       const keys = new Set((existing.budgets as unknown as { categoryId: string; month: string }[]).map((x) => `${x.categoryId}|${x.month}`))
       list = list.filter((x) => !keys.has(`${(x as unknown as { categoryId: string }).categoryId}|${(x as unknown as { month: string }).month}`))
     }
@@ -129,8 +182,8 @@ async function plan(b: Backup, mode: RestoreMode) {
   return { existing, toAdd }
 }
 
-export async function previewRestore(b: Backup, mode: RestoreMode): Promise<RestorePreview> {
-  const { existing, toAdd } = await plan(b, mode)
+export function previewRestore(b: Backup, mode: RestoreMode): RestorePreview {
+  const { existing, toAdd } = plan(b, mode)
   const tables = TABLE_KEYS.map((key) => {
     const incoming = b.data[key].length
     const added = toAdd[key].length
@@ -144,20 +197,23 @@ export async function previewRestore(b: Backup, mode: RestoreMode): Promise<Rest
   }
 }
 
+/**
+ * Applies an already decrypted + validated backup. Replace mode encrypts everything first and swaps storage in a
+ * single transaction (see VaultStore.replaceAll); merge mode adds missing records in one atomic write. If anything
+ * throws, the existing vault is unchanged.
+ */
 export async function applyRestore(b: Backup, mode: RestoreMode): Promise<RestorePreview> {
-  const preview = await previewRestore(b, mode)
-  const { toAdd } = await plan(b, mode)
-  await db.transaction('rw', ALL_TABLES(), async () => {
-    if (mode === 'replace') for (const t of ALL_TABLES()) await t.clear()
-    await db.categories.bulkAdd(toAdd.categories as never[])
-    await db.accounts.bulkAdd(toAdd.accounts as never[])
-    await db.transactions.bulkAdd(toAdd.transactions as never[])
-    await db.budgets.bulkAdd(toAdd.budgets as never[])
-    await db.loans.bulkAdd(toAdd.loans as never[])
-    await db.loanPayments.bulkAdd(toAdd.loanPayments as never[])
-    await db.goals.bulkAdd(toAdd.goals as never[])
-    if (mode === 'replace' && b.data.settings) await db.settings.put({ ...b.data.settings, lastBackupAt: b.data.settings.lastBackupAt })
-  })
-  await ensureSeed()
+  const preview = previewRestore(b, mode)
+  if (mode === 'replace') {
+    await vault.replaceAll({
+      accounts: b.data.accounts, transactions: b.data.transactions, categories: b.data.categories, budgets: b.data.budgets,
+      loans: b.data.loans, loanPayments: b.data.loanPayments, goals: b.data.goals, settings: b.data.settings ? [b.data.settings] : [],
+    })
+  } else {
+    const { toAdd } = plan(b, mode)
+    await vault.write((w) => {
+      for (const k of TABLE_KEYS) for (const r of toAdd[k]) w.put(k, r as never)
+    })
+  }
   return preview
 }

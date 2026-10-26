@@ -68,7 +68,7 @@ describe('ledger', () => {
       cats, '2025-04-01',
     )
     expect(list).toHaveLength(1)
-    expect(list[0].dueDate).toBe('2025-04-11')
+    expect(list[0]!.dueDate).toBe('2025-04-11')
   })
 })
 
@@ -78,13 +78,13 @@ describe('recurring series', () => {
     const all = [mk('2025-01-10'), mk('2025-02-10'), mk('2025-02-10', { merchant: 'Rent', amount: 2000000, recurring: 'yearly' }), mk('2025-02-12', { recurring: undefined })]
     const list = listRecurring(all, new Map())
     expect(list.map((s) => [s.title, s.dueDate, s.count])).toEqual([['Gym', '2025-03-10', 2], ['Rent', '2026-02-10', 1]])
-    expect(list[0].sourceId).toBe(all[1].id)
+    expect(list[0]!.sourceId).toBe(all[1]!.id)
     // yearly series is far away: listed, but not in the 30-day window
     expect(upcomingRecurring(all, new Map(), '2025-03-01').map((s) => s.title)).toEqual(['Gym'])
   })
   it('month-end series do not drift: 31st -> 28th -> 31st', () => {
     const list = listRecurring([mk('2025-01-31'), mk('2025-02-28')], new Map())
-    expect(list[0].dueDate).toBe('2025-03-31')
+    expect(list[0]!.dueDate).toBe('2025-03-31')
   })
   it('keys differ by amount, frequency and merchant (case-insensitive)', () => {
     expect(seriesKey(mk('2025-01-01'))).toBe(seriesKey(mk('2025-02-01', { merchant: 'GYM' })))
@@ -140,10 +140,10 @@ describe('loan maths', () => {
     const s = buildSchedule(100000000, 8.5, emi, '2025-01-01', 5)
     expect(s.months).toBeGreaterThanOrEqual(239)
     expect(s.months).toBeLessThanOrEqual(241) // EMI is rounded to whole paise, so a tiny final instalment may remain
-    expect(s.rows[s.rows.length - 1].closing).toBe(0)
+    expect(s.rows[s.rows.length - 1]!.closing).toBe(0)
     expect(s.rows.reduce((x, r) => x + r.principal + r.extra, 0)).toBe(100000000)
     expect(s.totalPaid).toBe(100000000 + s.totalInterest)
-    expect(s.rows[0].date).toBe('2025-01-05')
+    expect(s.rows[0]!.date).toBe('2025-01-05')
     expect(s.neverPaysOff).toBe(false)
   })
   it('due-day clamps to short months and persists', () => {
@@ -202,7 +202,7 @@ describe('goals', () => {
     const accounts = [acc('A', 50000)]
     const alloc = allocationByAccount(accounts, [], [g])
     expect(alloc[0]).toMatchObject({ balance: 50000, earmarked: 25000, free: 25000, overAllocated: false })
-    expect(allocationByAccount(accounts, [], [{ ...g, saved: 80000 }])[0].overAllocated).toBe(true)
+    expect(allocationByAccount(accounts, [], [{ ...g, saved: 80000 }])[0]!.overAllocated).toBe(true)
     expect(totalBalance(accounts, [])).toBe(50000)
   })
 })
@@ -218,7 +218,7 @@ describe('reports', () => {
       { from: '2025-01-01', to: '2025-03-31' },
     )
     expect(s.map((p) => [p.income, p.expense])).toEqual([[1000, 0], [0, 0], [0, 400]])
-    expect(s[0].rate).toBe(100)
-    expect(s[1].rate).toBeNull()
+    expect(s[0]!.rate).toBe(100)
+    expect(s[1]!.rate).toBeNull()
   })
 })

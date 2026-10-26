@@ -20,9 +20,10 @@ export function monthlySeries(txs: Transaction[], range: DateRange): MonthPoint[
     if (t.type === 'transfer') continue
     if (t.date < range.from || t.date > range.to) continue
     const i = idx.get(monthOf(t.date))
-    if (i === undefined) continue
-    if (t.type === 'income') pts[i].income += t.amount
-    else pts[i].expense += t.amount
+    const pt = i === undefined ? undefined : pts[i]
+    if (!pt) continue
+    if (t.type === 'income') pt.income += t.amount
+    else pt.expense += t.amount
   }
   for (const p of pts) {
     p.savings = p.income - p.expense
@@ -49,6 +50,6 @@ export function loanBalanceTrend(loans: Loan[], payments: LoanPayment[], endMont
   }
   // drop leading months before any loan existed (keep at least two points so a chart can draw)
   let first = 0
-  while (first < out.length - 2 && out[first].balance === 0) first++
+  while (first < out.length - 2 && out[first]!.balance === 0) first++
   return out.slice(first)
 }

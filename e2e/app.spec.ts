@@ -1,12 +1,15 @@
+import fs from 'node:fs'
 import { expect, test as base, type Page } from '@playwright/test'
-import { addAccount, addTx, watchErrors } from './helpers'
+import { addAccount, addTx, PW, PW2, setupVault, unlock, watchErrors } from './helpers'
 
 // One browser context for the whole serial flow so IndexedDB data carries from test to test (like a real user session).
 let shared: Page
+let pw = PW // the CURRENT vault password (changes when a test creates a new vault)
 const test = base.extend<{ page: Page }>({ page: async ({ browser: _b }, use) => { await use(shared) } })
 base.describe.configure({ mode: 'serial' })
 base.beforeAll(async ({ browser }) => {
   shared = await (await browser.newContext({ acceptDownloads: true, viewport: { width: 1280, height: 900 } })).newPage()
+  await setupVault(shared) // first run: create the encrypted vault
 })
 base.afterAll(async () => { await shared.context().close() })
 
@@ -51,6 +54,7 @@ test('income, expense, budget and persistence across reload', async ({ page }) =
 
   // records survive a refresh and navigation
   await page.reload()
+  await unlock(page, pw) // a reload locks the vault: the key only ever lived in memory
   await page.goto('/#/expenses')
   await expect(page.getByTestId('tx-row')).toHaveCount(2)
   expect(problems).toEqual([])
@@ -117,33 +121,78 @@ test('loan: record EMI reduces principal only, creates one expense', async ({ pa
   await expect(page.getByRole('heading', { name: 'Estimated amortisation schedule' })).toBeVisible()
 })
 
-test('backup export, wipe, restore', async ({ page }) => {
+test('encrypted backup: export, wipe everything, new vault, restore (replace)', async ({ page }) => {
+  const BPW = 'e2e backup passphrase long enough 55!'
   await page.goto('/#/settings')
-  const [dl] = await Promise.all([page.waitForEvent('download'), page.getByRole('button', { name: /Download full backup/ }).click()])
+  const form = page.getByRole('form', { name: 'Create encrypted backup' })
+
+  // a weak or mismatched backup password is refused
+  await form.getByLabel('Backup password', { exact: true }).fill('short')
+  await form.getByLabel('Confirm backup password').fill('short')
+  await form.getByRole('button', { name: /Download encrypted backup/ }).click()
+  await expect(form.getByRole('alert')).toContainText('stronger')
+
+  await form.getByLabel('Backup password', { exact: true }).fill(BPW)
+  await form.getByLabel('Confirm backup password').fill(BPW)
+  const [dl] = await Promise.all([page.waitForEvent('download'), form.getByRole('button', { name: /Download encrypted backup/ }).click()])
   const path = await dl.path()
-  expect(dl.suggestedFilename()).toMatch(/^spendflow-backup-\d{4}-\d{2}-\d{2}\.json$/)
+  expect(dl.suggestedFilename()).toMatch(/^spendflow-backup-\d{4}-\d{2}-\d{2}\.sfbackup\.json$/)
+  const content = fs.readFileSync(path, 'utf8')
+  for (const secret of ['Acme Corp', 'Main Bank', 'Local Mart', 'Car Loan', 'HDFC', 'Groceries', 'Salary']) expect(content, `"${secret}" is readable in the backup file`).not.toContain(secret)
+  expect(JSON.parse(content)).toMatchObject({ format: 'spendflow-encrypted-backup', formatVersion: 1, cipher: 'AES-256-GCM', kdf: { name: 'PBKDF2', hash: 'SHA-256' } })
   await expect(page.getByText(/Last backup:/)).not.toContainText('never')
 
-  // wipe with strong confirmation
+  // wipe everything: the vault (and its password) is destroyed and the app returns to first-time setup
   await page.getByRole('button', { name: 'Delete all data…' }).click()
   const c = page.getByRole('dialog', { name: 'Delete ALL data?' })
   await expect(c.getByRole('button', { name: 'Delete everything' })).toBeDisabled()
   await c.getByLabel(/Type DELETE/).fill('DELETE')
   await c.getByRole('button', { name: 'Delete everything' }).click()
+  await expect(page.getByRole('heading', { name: 'Protect your data', level: 1 })).toBeVisible()
+  expect(await page.evaluate(async () => (await indexedDB.databases()).map((d) => d.name))).not.toContain('spendflow')
+
+  // "another device": brand-new vault with a DIFFERENT password
+  pw = PW2
+  await setupVault(page, PW2)
   await page.goto('/#/expenses')
   await expect(page.getByTestId('tx-row')).toHaveCount(0)
-
-  // invalid file -> clear errors, nothing changes
   await page.goto('/#/settings')
+
+  // a damaged file is rejected before any password prompt can change anything
   await page.getByLabel('Backup file').setInputFiles({ name: 'bad.json', mimeType: 'application/json', buffer: Buffer.from('{"nope":true}') })
   await expect(page.getByTestId('restore-preview')).toContainText('not a SpendFlow backup')
 
-  // valid file -> preview -> merge
-  await page.getByLabel('Backup file').setInputFiles(path)
+  // a tampered ciphertext fails authentication with a generic message
+  const tampered = JSON.parse(content)
+  const ct = Buffer.from(tampered.ciphertext, 'base64')
+  ct[Math.floor(ct.length / 2)] ^= 1
+  tampered.ciphertext = ct.toString('base64')
+  await page.getByLabel('Backup file').setInputFiles({ name: 'tampered.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(tampered)) })
   const prev = page.getByTestId('restore-preview')
-  await expect(prev).toContainText('Valid SpendFlow backup')
-  await prev.getByRole('button', { name: 'Merge backup…' }).click()
-  await page.getByRole('dialog', { name: 'Merge backup into current data?' }).getByRole('button', { name: 'Merge' }).click()
+  await prev.getByLabel('Backup password').fill(BPW)
+  await prev.getByRole('button', { name: 'Decrypt and preview' }).click()
+  await expect(prev).toContainText('wrong, or the file was modified or corrupted')
+
+  // the real file: header preview shows no financial details; wrong password fails; right password succeeds
+  await page.getByLabel('Backup file').setInputFiles(path)
+  await expect(prev).toContainText('Encrypted SpendFlow backup v1')
+  await expect(prev).not.toContainText('Main Bank')
+  await prev.getByLabel('Backup password').fill('not the right password 99!')
+  await prev.getByRole('button', { name: 'Decrypt and preview' }).click()
+  await expect(prev).toContainText('wrong, or the file was modified or corrupted')
+  await prev.getByLabel('Backup password').fill(BPW)
+  await prev.getByRole('button', { name: 'Decrypt and preview' }).click()
+  await expect(prev).toContainText('Authenticated and validated')
+
+  // replace requires explicit typed confirmation
+  await prev.getByRole('radio', { name: /Replace/ }).check()
+  await prev.getByRole('button', { name: 'Replace data…' }).click()
+  const rc = page.getByRole('dialog', { name: 'Replace ALL current data?' })
+  await expect(rc.getByRole('button', { name: 'Replace everything' })).toBeDisabled()
+  await rc.getByLabel(/Type REPLACE/).fill('REPLACE')
+  await rc.getByRole('button', { name: 'Replace everything' }).click()
+  await expect(page.getByRole('status').filter({ hasText: 'Restore complete' })).toBeVisible()
+
   await page.goto('/#/expenses')
   await expect(page.getByTestId('tx-row')).toHaveCount(2) // grocery + EMI
   await page.goto('/#/income')
@@ -152,6 +201,12 @@ test('backup export, wipe, restore', async ({ page }) => {
   await expect(page.getByRole('article', { name: 'Main Bank' })).toBeVisible()
   await page.goto('/#/loans')
   await expect(page.getByRole('article', { name: 'Car Loan' })).toContainText('₹92,115.12')
+
+  // the restored vault is still protected by the NEW password and nothing readable is stored
+  await page.reload()
+  await unlock(page, PW2)
+  await page.goto('/#/accounts')
+  await expect(page.getByRole('article', { name: 'Main Bank' })).toBeVisible()
 })
 
 test('CSV import shows preview, errors and duplicates', async ({ page }) => {
@@ -176,10 +231,13 @@ test('CSV import shows preview, errors and duplicates', async ({ page }) => {
 test('theme toggle persists and routes survive refresh', async ({ page }) => {
   await page.goto('/#/reports')
   await page.reload()
+  await unlock(page, pw)
   await expect(page.getByRole('heading', { name: 'Reports' })).toBeVisible()
   await page.getByRole('button', { name: 'Switch to dark theme' }).click()
   await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark')
   await page.reload()
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark') // theme applies even on the lock screen
+  await unlock(page, pw)
   await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark')
 })
 
@@ -233,6 +291,7 @@ test('recurring: overdue item is recorded with one click, then stopped', async (
 
   // survives a reload (it is stored data, not UI state)
   await page.reload()
+  await unlock(page, pw)
   await expect(page.getByTestId('recurring-row').filter({ hasText: 'Gym Club' })).toContainText('2 recorded')
 
   // stopping needs confirmation; Cancel keeps it

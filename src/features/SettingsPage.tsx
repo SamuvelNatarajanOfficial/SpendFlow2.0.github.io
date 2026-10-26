@@ -12,6 +12,7 @@ import { formatINR } from '@/lib/money'
 import { totalBalance } from '@/lib/calc/ledger'
 import type { Category } from '@/types'
 import DataSection from './DataSection'
+import SecuritySection from './SecuritySection'
 
 const TZS = ['Asia/Kolkata', 'Asia/Dubai', 'Asia/Singapore', 'Europe/London', 'America/New_York', 'America/Los_Angeles', 'UTC']
 
@@ -144,17 +145,18 @@ export default function SettingsPage() {
         <p className="num mt-2 text-xs text-subtle">Total calculated balance {formatINR(totalBalance(d.accounts, d.transactions))}</p>
       </Section>
 
+      <SecuritySection />
       <Categories />
       <DataSection />
 
       <Section title="Privacy & security" actions={<ShieldCheck size={18} className="text-pos" />}>
         <ul className="list-disc space-y-1.5 pl-5 text-sm text-subtle">
-          <li>All data stays in <strong>this browser</strong> (IndexedDB). Nothing is sent to any server, analytics or API.</li>
-          <li>Browser storage is <strong>not encrypted</strong>. Anyone who can use this browser profile or device can read the data.</li>
+          <li>All data stays in <strong>this browser</strong> (IndexedDB), <strong>encrypted</strong> with AES-256-GCM using a key derived from your password. Nothing is sent to any server, analytics or API.</li>
+          <li>Encryption protects data <strong>while locked</strong>. While the app is unlocked, the decrypted data is in memory and anyone using your unlocked session, or malicious code running in this page or a browser extension, can read it. Lock when you step away.</li>
           <li>Clearing site data, private browsing or uninstalling the browser can <strong>erase your records</strong>. Back up regularly.</li>
           <li>SpendFlow never asks for bank credentials, UPI PINs, OTPs or card details, and does not connect to bank accounts. Don't store them in notes.</li>
         </ul>
-        <Notice>Backup files are plain-text JSON. Keep them private.</Notice>
+        <Notice>Your password cannot be recovered. Keep an encrypted backup and remember its password. See docs/SECURITY.md for the full threat model.</Notice>
       </Section>
     </div>
   )

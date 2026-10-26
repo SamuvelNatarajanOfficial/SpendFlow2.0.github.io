@@ -1,6 +1,6 @@
 # SpendFlow 2.0
 
-**Every rupee. Every goal. Under control.** A local-first personal finance manager (web + installable PWA) for tracking income, expenses, accounts, budgets, loans/EMIs and goals. No backend, no login, no subscription: all data lives in your browser (IndexedDB).
+**Every rupee. Every goal. Under control.** A local-first personal finance manager (web + installable PWA) for tracking income, expenses, accounts, budgets, loans/EMIs and goals. No backend, no subscription: all data lives in your browser (IndexedDB) and is **encrypted with a password you choose** (AES-256-GCM). See [docs/SECURITY.md](docs/SECURITY.md) for the architecture and threat model.
 
 ## Features
 
@@ -12,7 +12,8 @@
 - **Loans & EMI**: multiple loans, interest/principal split per payment, extra-principal payments, payment history, estimated amortisation schedule, editable repayment plan with payoff comparison, manual outstanding-balance correction.
 - **Goals**: emergency fund, savings, major purchase, custom, and an automatic debt-free goal derived from your loans.
 - **Reports**: monthly/yearly tables and charts, category analysis, savings-rate trend, budget vs actual, loan balance trend; CSV exports.
-- **Backup & recovery**: full JSON backup (versioned schema), validated restore with preview (merge or replace), CSV import with preview/validation/duplicate detection, last-backup date and reminder banner.
+- **Security**: password-protected encrypted vault, lock screen, inactivity and app-hidden auto-lock, password change that re-encrypts everything, strength guidance.
+- **Backup & recovery**: password-protected **encrypted** backup files (versioned, authenticated), restore with metadata-only preview and typed confirmation (merge or replace), CSV import with preview/validation/duplicate detection, last-backup date and reminder banner.
 - **Settings**: INR / Asia/Kolkata, light/dark theme, categories, accounts, sample data (flagged and removable), clear-all with typed confirmation.
 
 ## Design decisions & assumptions
@@ -29,10 +30,13 @@
 
 ## Privacy & security
 
-- Nothing is sent to any server, analytics service or API. There are no keys or secrets in the code.
-- Browser storage is **not encrypted**. Anyone with access to your browser profile/device can read it. Clearing site data, private browsing, or uninstalling the browser can erase it. **Back up regularly**; backup files are plain-text JSON, so store them privately.
+- Nothing is sent to any server, analytics service or API. There are no keys or secrets in the code, no third-party scripts, fonts or CDNs, and a strict Content-Security-Policy blocks other origins.
+- **Your data is encrypted at rest in the browser.** On first run you create a password. Every record is encrypted (AES-256-GCM, key derived with PBKDF2-HMAC-SHA-256, 600,000+ iterations calibrated to your device) before it is written to IndexedDB. The key lives only in memory and is dropped when the vault locks. Reloading the page locks it.
+- **There is no password recovery.** If you forget it, the data can only be restored from an encrypted backup (which has its own password). Keep a backup.
+- Encryption protects data **while the vault is locked**. While unlocked, decrypted data is in memory, so anyone using your unlocked session, or malicious code running in the page or a browser extension, can read it. Lock when you step away. IndexedDB record counts and sizes remain visible to someone with access to the browser profile. Clearing site data can erase everything. See [docs/SECURITY.md](docs/SECURITY.md) for the full threat model and limitations.
 - Never enter bank credentials, UPI PINs, OTPs or card details. The app does not need them and does not connect to banks.
 - The app asks the browser for persistent storage (best effort) to reduce eviction risk.
+- **Upgrading from an earlier (unencrypted) version:** on first launch the setup screen detects your existing data, encrypts it into the new vault, verifies it, and only then deletes the old plaintext copy.
 
 ## Local development
 
@@ -73,31 +77,36 @@ Core features work offline after the first load. When a new version is available
 
 ## Backup & restore
 
-- **Settings → Data → Download full backup** writes `spendflow-backup-YYYY-MM-DD.json`. The "last backup" date updates only after the download is triggered, and a banner reminds you after the chosen number of days.
-- **Restore** validates the file against the versioned schema (including references between records) and shows a preview. *Merge* only adds missing records and never overwrites; *Replace* requires typing `REPLACE` and downloads a safety backup first. A file that fails validation changes nothing.
-- **CSV import** columns: `date, type, amount, category, account, to_account, payment_method, merchant, notes` (dates `YYYY-MM-DD` or `DD/MM/YYYY`). The preview lists per-line errors and duplicates; duplicates are skipped unless you opt in. New categories are created; accounts must already exist.
+- **Settings → Encrypted backup & recovery → Download encrypted backup** asks for a backup password (independent of the vault password; the strength meter applies) and writes `spendflow-backup-YYYY-MM-DD.sfbackup.json`. The "last backup" date updates only after the download is triggered, and a banner reminds you after the chosen number of days. There is **no unencrypted JSON export**.
+- **Restore**: choose the file; the public header (format version, date, algorithm) is shown without a password; enter the backup password to decrypt and authenticate; the content is validated against the schema; then you see a preview. *Merge* only adds missing records and never overwrites; *Replace* requires typing `REPLACE`. Nothing in your vault changes until you confirm, and a failure at any point leaves your existing data intact. A backup can be restored on any device: create a vault there first, then restore.
+- Old unencrypted backups from earlier versions can still be imported (they become encrypted in the vault).
+- **CSV** export is for spreadsheets and is **not encrypted**; every CSV download asks you to confirm that. CSV import columns: `date, type, amount, category, account, to_account, payment_method, merchant, notes` (dates `YYYY-MM-DD` or `DD/MM/YYYY`). The preview lists per-line errors and duplicates; duplicates are skipped unless you opt in. New categories are created; accounts must already exist.
 
 ## Project layout
 
 ```
 src/lib/        money, dates, and pure calculation modules (calc/ledger, budget, loan, goals, reports)
-src/db/         Dexie schema, Zod schemas, repositories (repo.ts), backup, CSV, sample data
+src/vault/      crypto primitives, encrypted vault store, encrypted backup file, legacy migration, password policy
+src/db/         Zod schemas, repositories (repo.ts), backup payload logic, CSV, sample data
+docs/           SECURITY.md (architecture + threat model)
 src/features/   pages (Dashboard, Transactions, Accounts, Budgets, Loans, Goals, Reports, Settings)
 src/components/ shared UI (modal/confirm/toast, forms, charts)
 e2e/            Playwright tests (production build)
 ```
 
-Schema changes: add a new `this.version(n)` in `src/db/db.ts` (never edit a released version) and bump `BACKUP_SCHEMA_VERSION` with a migration in `parseBackup`.
+Schema changes: records are JSON inside ciphertext, so evolve them with Zod schemas (`src/db/schemas.ts`), bump `RECORD_SCHEMA_VERSION` (`src/vault/crypto.ts`) and `BACKUP_SCHEMA_VERSION` with a migration in `parseBackup` / on unlock. Changes to the IndexedDB container itself use a new `this.version(n)` in `src/vault/store.ts` (never edit a released version).
 
 ## Testing
 
-- **Unit/database (Vitest, fake-indexeddb)**: money & date handling, balances and transfers, budgets, savings rate, loan interest/amortisation/plans, goals, reports, date filtering, backup export/validation/merge/replace, CSV import/export, persistence, sample data.
-- **End-to-end (Playwright, production build)**: add income, record expense, create budget, record EMI, export backup, wipe, restore, CSV import, theme persistence, refresh on deep routes, all pages free of console errors / failed requests, no horizontal scroll at phone width, offline reload via service worker.
+- **Unit/database (Vitest, fake-indexeddb)**: money & date handling, balances and transfers, budgets, savings rate, loan interest/amortisation/plans, goals, reports, date filtering, recurring items, CSV import/export, persistence, sample data, and the security layer: unlock/lock, wrong password, tampered ciphertext/headers, unique salts and nonces, encryption round trips, **no plaintext in raw IndexedDB**, encrypted backup round trip / wrong password / corrupted / unsupported / interrupted restore, password change, legacy migration, locked-state API access.
+- **End-to-end (Playwright, production build)**: first-run setup validation, lock/unlock, nothing secret in browser storage, password change, inactivity and hidden-app auto-lock (fake clock), CSP enforcement and XSS payloads rendered as text, add income, record expense, create budget, record EMI, recurring items, encrypted backup → wipe → new vault → restore, CSV import, theme persistence, refresh on deep routes, all pages free of console errors / failed requests, no horizontal scroll at phone width, offline reload via service worker.
+- The tests use a deliberately tiny PBKDF2 cost (set in `src/test/setup.ts`) for speed. The frozen production policy (≥ 600,000 iterations) is asserted separately.
 
 ## Limitations & ideas
 
 - Single device/browser: there is no sync. Move data between devices with backup files.
-- No authentication or encryption at rest (by design for v1). An optional passphrase-encrypted backup would be a natural next step.
+- **No password recovery** and no multi-device sync: move data between devices with encrypted backups. There is no biometric/WebAuthn unlock yet.
+- PBKDF2 is not memory-hard (Web Crypto has no Argon2/scrypt); a strong passphrase matters. Client-side encryption cannot protect against malicious code running in the page while the vault is unlocked. See [docs/SECURITY.md](docs/SECURITY.md).
 - Recurring items are recorded with one click, not automatically. Catching up several missed periods means pressing Record once per period.
 - Loan schedules are estimates (see assumptions); floating-rate loans need manual correction.
 - Single currency (INR). Multi-currency, bank-statement PDF import and account-level transaction search are future work.
@@ -106,7 +115,10 @@ Schema changes: add a new `this.version(n)` in `src/db/db.ts` (never edit a rele
 ## Troubleshooting
 
 - **"Storage is unavailable"**: IndexedDB is blocked (private window or strict site-data settings). Use a normal window and allow site data.
-- **My data disappeared**: browser data was cleared or you're in a different browser profile. Restore your latest backup file.
+- **I forgot my password**: it cannot be recovered. On the unlock screen choose *Forgot your password?* → *Erase vault and start over*, set a new password, then restore your latest encrypted backup (you need the backup's password).
+- **Unlocking takes a second or two**: that is the key derivation, calibrated for your device. It is the main defence against password guessing.
+- **"Can't run securely here"**: the browser lacks Web Crypto or the page is not on HTTPS/localhost. There is no insecure fallback by design.
+- **My data disappeared**: browser data was cleared or you're in a different browser profile. Restore your latest encrypted backup.
 - **App doesn't update**: close all tabs of the app and reopen, or accept the *Update now* prompt. In DevTools → Application → Service Workers you can *Unregister* (data stays).
 - **E2E tests reuse an old build**: Playwright reuses a server already on port 4173. Stop it (or run `npm run build` first) so tests run against current code.
 - **`npm install` fails with a native-binding error**: delete `node_modules` and `package-lock.json`, then reinstall (a known npm optional-dependency bug).

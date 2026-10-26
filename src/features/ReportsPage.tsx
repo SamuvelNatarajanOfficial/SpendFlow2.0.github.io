@@ -4,7 +4,8 @@ import { useData } from '@/app/data'
 import { RangeFilter, useRange } from '@/components/RangeFilter'
 import { BalanceTrendChart, CategoryDonut, IncomeExpenseChart, SavingsRateChart } from '@/components/charts'
 import { PageHeader, Section, Stat } from '@/components/ui'
-import { downloadText, rowsToCsv, transactionsToCsv } from '@/db/csv'
+import { rowsToCsv, transactionsToCsv } from '@/db/csv'
+import { usePlainExport } from '@/components/usePlainExport'
 import { expenseByCategory, filterByRange, essentialSplit, savingsRate, sumExpense, sumIncome } from '@/lib/calc/ledger'
 import { monthBudgetStatuses } from '@/lib/calc/budget'
 import { loanBalanceTrend, monthlySeries } from '@/lib/calc/reports'
@@ -13,6 +14,7 @@ import { formatINR, paiseToInput } from '@/lib/money'
 
 export default function ReportsPage() {
   const d = useData()
+  const plainExport = usePlainExport()
   const r = useRange('this-year')
   const inRange = useMemo(() => filterByRange(d.transactions, r.range), [d.transactions, r.range])
   const income = sumIncome(inRange)
@@ -23,7 +25,7 @@ export default function ReportsPage() {
   const split = essentialSplit(inRange)
   const months = monthsInRange(r.range)
   const [bm, setBm] = useState('')
-  const budgetMonth = months.includes(bm) ? bm : months.includes(monthOf(d.today)) ? monthOf(d.today) : months[months.length - 1]
+  const budgetMonth = months.includes(bm) ? bm : months.includes(monthOf(d.today)) ? monthOf(d.today) : (months[months.length - 1] ?? monthOf(d.today))
   const bva = useMemo(() => monthBudgetStatuses(d.budgets, d.transactions, budgetMonth), [d.budgets, d.transactions, budgetMonth])
   const loanTrend = useMemo(() => {
     const end = monthOf(r.range.to) > monthOf(d.today) ? monthOf(d.today) : monthOf(r.range.to)
@@ -32,16 +34,16 @@ export default function ReportsPage() {
   }, [d.loans, d.loanPayments, r.range, d.today, months.length])
 
   const tag = `${r.range.from}_to_${r.range.to}`
-  const exportMonthly = () => downloadText(`spendflow-monthly-${tag}.csv`, rowsToCsv(['month', 'income', 'expense', 'net_savings', 'savings_rate_pct'], series.map((p) => [p.month, paiseToInput(p.income), paiseToInput(p.expense), paiseToInput(p.savings), p.rate === null ? '' : p.rate.toFixed(1)])), 'text/csv')
-  const exportCats = () => downloadText(`spendflow-categories-${tag}.csv`, rowsToCsv(['category', 'amount', 'share_pct'], cats.map((c) => [c.name, paiseToInput(c.amount), expense ? ((c.amount / expense) * 100).toFixed(1) : '0'])), 'text/csv')
-  const exportBudget = () => downloadText(`spendflow-budget-vs-actual-${budgetMonth}.csv`, rowsToCsv(['month', 'category', 'budget', 'spent', 'remaining', 'percent_used'], bva.map((b) => [budgetMonth, d.catMap.get(b.budget.categoryId)?.name ?? '', paiseToInput(b.budget.amount), paiseToInput(b.spent), paiseToInput(b.remaining), Number.isFinite(b.percentUsed) ? b.percentUsed.toFixed(1) : ''])), 'text/csv')
+  const exportMonthly = () => plainExport(`spendflow-monthly-${tag}.csv`, rowsToCsv(['month', 'income', 'expense', 'net_savings', 'savings_rate_pct'], series.map((p) => [p.month, paiseToInput(p.income), paiseToInput(p.expense), paiseToInput(p.savings), p.rate === null ? '' : p.rate.toFixed(1)])))
+  const exportCats = () => plainExport(`spendflow-categories-${tag}.csv`, rowsToCsv(['category', 'amount', 'share_pct'], cats.map((c) => [c.name, paiseToInput(c.amount), expense ? ((c.amount / expense) * 100).toFixed(1) : '0'])))
+  const exportBudget = () => plainExport(`spendflow-budget-vs-actual-${budgetMonth}.csv`, rowsToCsv(['month', 'category', 'budget', 'spent', 'remaining', 'percent_used'], bva.map((b) => [budgetMonth, d.catMap.get(b.budget.categoryId)?.name ?? '', paiseToInput(b.budget.amount), paiseToInput(b.spent), paiseToInput(b.remaining), Number.isFinite(b.percentUsed) ? b.percentUsed.toFixed(1) : ''])))
 
   return (
     <div className="space-y-5">
       <PageHeader
         title="Reports"
         subtitle={`${formatDate(r.range.from)} – ${formatDate(r.range.to)}`}
-        actions={<button type="button" className="btn-secondary" disabled={inRange.length === 0} onClick={() => downloadText(`spendflow-transactions-${tag}.csv`, transactionsToCsv(inRange, d.accounts, d.categories), 'text/csv')}><Download size={16} /> Transactions CSV</button>}
+        actions={<button type="button" className="btn-secondary" disabled={inRange.length === 0} onClick={() => plainExport(`spendflow-transactions-${tag}.csv`, transactionsToCsv(inRange, d.accounts, d.categories))}><Download size={16} /> Transactions CSV</button>}
       />
       <RangeFilter r={r} />
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">

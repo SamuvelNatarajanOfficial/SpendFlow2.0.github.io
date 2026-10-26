@@ -2,10 +2,13 @@ import { lazy, Suspense, useState } from 'react'
 import { HashRouter, NavLink, Navigate, Route, Routes, Link } from 'react-router-dom'
 import { useRegisterSW } from 'virtual:pwa-register/react'
 import {
-  BarChart3, Home, LayoutGrid, Landmark, Moon, PiggyBank, Plus, Repeat, Settings as SettingsIcon, Sun, Target, TrendingDown, TrendingUp, Wallet, X,
+  BarChart3, Home, LayoutGrid, Landmark, Lock, Moon, PiggyBank, Plus, Repeat, Settings as SettingsIcon, Sun, Target, TrendingDown, TrendingUp, Wallet, X,
 } from 'lucide-react'
 import clsx from 'clsx'
 import { DataProvider, useData } from './data'
+import { VaultGate } from './VaultGate'
+import { AutoLock } from './AutoLock'
+import { vault } from '@/vault/store'
 import { UIProvider, useUI } from './ui-context'
 import { ConfirmProvider, Notice, ToastProvider } from '@/components/ui'
 import { updateSettings } from '@/db/repo'
@@ -45,6 +48,14 @@ function ThemeToggle() {
   )
 }
 
+function LockButton() {
+  return (
+    <button type="button" className="btn-ghost !px-2.5" onClick={() => void vault.lock()} aria-label="Lock SpendFlow" title="Lock now">
+      <Lock size={18} />
+    </button>
+  )
+}
+
 function Logo() {
   return (
     <Link to="/" className="flex items-center gap-2.5">
@@ -66,6 +77,11 @@ function Banners() {
   const showBackup = hasData && days >= settings.backupReminderDays && !dismissedToday
   return (
     <div className="mb-4 space-y-2">
+      {vault.integrityIssues > 0 && (
+        <Notice tone="neg">
+          {vault.integrityIssues} stored record(s) failed verification when unlocking (corrupted or modified) and were ignored. Restore from an encrypted backup if data looks missing.
+        </Notice>
+      )}
       {settings.sampleLoaded && (
         <Notice tone="warn" action={<Link className="btn-secondary !min-h-[34px]" to="/settings#data">Manage sample data</Link>}>
           You're viewing <strong>sample data</strong>. It is flagged and can be removed in Settings without touching your own records.
@@ -144,15 +160,15 @@ function Shell() {
           ))}
         </nav>
         <div className="flex items-center justify-between text-xs text-subtle">
-          <span>Local-first · INR</span>
-          <ThemeToggle />
+          <span>Encrypted · INR</span>
+          <span className="flex"><LockButton /><ThemeToggle /></span>
         </div>
       </aside>
 
       <div className="min-w-0 flex-1">
         <header className="sticky top-0 z-30 flex items-center justify-between border-b border-line bg-bg/90 px-4 py-2.5 backdrop-blur md:hidden">
           <Logo />
-          <ThemeToggle />
+          <span className="flex"><LockButton /><ThemeToggle /></span>
         </header>
         <main id="main" className="mx-auto max-w-6xl px-4 pb-28 pt-5 md:px-8 md:pb-10 md:pt-8">
           <Banners />
@@ -193,6 +209,7 @@ function Shell() {
       </nav>
       {more && <MoreSheet onClose={() => setMore(false)} />}
       <PwaPrompt />
+      <AutoLock />
     </div>
   )
 }
@@ -210,13 +227,15 @@ export default function App() {
   return (
     <ToastProvider>
       <ConfirmProvider>
-        <DataProvider>
-          <HashRouter>
-            <UIProvider>
-              <Shell />
-            </UIProvider>
-          </HashRouter>
-        </DataProvider>
+        <VaultGate>
+          <DataProvider>
+            <HashRouter>
+              <UIProvider>
+                <Shell />
+              </UIProvider>
+            </HashRouter>
+          </DataProvider>
+        </VaultGate>
       </ConfirmProvider>
     </ToastProvider>
   )

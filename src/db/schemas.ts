@@ -113,6 +113,8 @@ export const settingsSchema = z.object({
   backupReminderDays: z.number().int().min(1).max(365),
   sampleLoaded: z.boolean().optional(),
   dismissedBackupBannerAt: z.string().optional(),
+  autoLockMinutes: z.number().int().min(0).max(240).optional(),
+  lockOnHideSeconds: z.number().int().min(-1).max(3600).optional(),
 })
 
 export const BACKUP_APP = 'spendflow'

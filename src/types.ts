@@ -134,6 +134,10 @@ export interface Settings {
   backupReminderDays: number
   sampleLoaded?: boolean
   dismissedBackupBannerAt?: Timestamp
+  /** lock after this many idle minutes (0 = never). Default 5. */
+  autoLockMinutes?: number
+  /** lock this many seconds after the tab/app is hidden (0 = immediately, -1 = never). Default 60. */
+  lockOnHideSeconds?: number
 }
 
 export interface DateRange {

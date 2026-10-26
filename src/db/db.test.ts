@@ -1,19 +1,38 @@
-import { beforeEach, describe, expect, it } from 'vitest'
-import { db } from './db'
-import { accounts, budgets, recurring, categories, clearAllData, ensureSeed, goals, loans, transactions, RepoError } from './repo'
-import { applyRestore, buildBackup, exportBackupJson, parseBackup, previewRestore } from './backup'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { vault } from '@/vault/store'
+import type { TableMap, TableName } from '@/vault/format'
+import { accounts, budgets, recurring, categories, goals, loans, transactions, RepoError, getSettings } from './repo'
+import { applyRestore, buildBackup, exportEncryptedBackup, inspectBackupFile, openBackupFile, previewRestore } from './backup'
+import { encryptBackup } from '@/vault/backupFile'
 import { previewCsv, transactionsToCsv } from './csv'
 import { applyCsvImport } from './importCsv'
 import { loadSampleData, removeSampleData } from './sample'
 import { accountBalance } from '@/lib/calc/ledger'
 import { builtInCategoryId } from './defaults'
 
+const PW = 'correct horse battery staple 42!'
+
+/** Test-only adapter so assertions read against the decrypted in-memory vault like a table. */
+function tbl<K extends TableName>(t: K) {
+  type R = TableMap[K]
+  return {
+    toArray: async (): Promise<R[]> => vault.all(t),
+    get: async (id: string): Promise<R | undefined> => vault.get(t, id),
+    count: async (): Promise<number> => vault.count(t),
+    where: (field: string) => ({ equals: (v: unknown) => ({ first: async (): Promise<R | undefined> => vault.all(t).find((r) => (r as unknown as Record<string, unknown>)[field] === v) }) }),
+    filter: (fn: (r: R) => boolean) => ({ first: async (): Promise<R | undefined> => vault.filter(t, fn)[0] }),
+    delete: async (id: string) => vault.write((w) => w.delete(t, id)),
+    clear: async () => vault.write((w) => vault.all(t).forEach((r) => w.delete(t, r.id))),
+  }
+}
+const db = { accounts: tbl('accounts'), transactions: tbl('transactions'), categories: tbl('categories'), budgets: tbl('budgets'), loans: tbl('loans'), loanPayments: tbl('loanPayments'), goals: tbl('goals'), settings: tbl('settings') }
+
 const food = builtInCategoryId('expense', 'Groceries')
 const salary = builtInCategoryId('income', 'Salary')
 
 async function wipe() {
-  for (const t of db.tables) await t.clear()
-  await ensureSeed()
+  await vault.destroy()
+  await vault.initialize(PW, { iterations: 1000 })
 }
 beforeEach(wipe)
 
@@ -27,12 +46,10 @@ async function seedBasic() {
 }
 
 describe('persistence & repositories', () => {
-  it('seeds default categories and settings exactly once', async () => {
-    await ensureSeed()
-    await ensureSeed()
+  it('seeds default categories and settings when the vault is created', async () => {
     const cats = await db.categories.toArray()
     expect(cats.length).toBe(18)
-    expect((await db.settings.get('app'))?.timezone).toBe('Asia/Kolkata')
+    expect((await getSettings()).timezone).toBe('Asia/Kolkata')
   })
   it('stores records durably and computes balances from them', async () => {
     const { a, b } = await seedBasic()
@@ -77,7 +94,7 @@ describe('persistence & repositories', () => {
     await budgets.upsert(c.id, '2025-03', 700000)
     const all = await db.budgets.toArray()
     expect(all).toHaveLength(1)
-    expect(all[0].amount).toBe(700000)
+    expect(all[0]!.amount).toBe(700000)
     expect(await budgets.copyMonth('2025-03', '2025-04')).toBe(1)
     expect(await budgets.copyMonth('2025-03', '2025-04')).toBe(0)
     await categories.remove(c.id) // also removes its budgets
@@ -166,8 +183,8 @@ describe('loan payments', () => {
     const { a, loan } = await mkLoan()
     await loans.recordPayment({ loanId: loan.id, date: '2025-02-05', kind: 'emi', amount: 867823, accountId: a.id })
     const t = (await db.transactions.toArray())[0]
-    await expect(transactions.update(t.id, { amount: 1 })).rejects.toThrow(/Loans page/)
-    await expect(transactions.remove(t.id)).rejects.toThrow(/Loans page/)
+    await expect(transactions.update(t!.id, { amount: 1 })).rejects.toThrow(/Loans page/)
+    await expect(transactions.remove(t!.id)).rejects.toThrow(/Loans page/)
     await loans.remove(loan.id)
     expect(await db.transactions.count()).toBe(0)
     expect(await db.loanPayments.count()).toBe(0)
@@ -180,59 +197,168 @@ describe('loan payments', () => {
   })
 })
 
-describe('backup & restore', () => {
-  it('exports a versioned backup that round-trips through replace restore', async () => {
+describe('backup & restore (encrypted)', () => {
+  const BPW = 'another long backup passphrase 7!'
+  const fast = { iterations: 1000 }
+
+  it('exports an encrypted file that round-trips through replace restore', async () => {
     await seedBasic()
     await loadSampleData('2025-06-15')
-    const before = await buildBackup()
-    const { json } = await exportBackupJson()
-    const parsed = parseBackup(json)
-    expect(parsed.ok).toBe(true)
-    await clearAllData()
-    expect(await db.transactions.count()).toBe(0)
-    if (!parsed.ok) return
-    const preview = await applyRestore(parsed.backup, 'replace')
+    const before = buildBackup()
+    const { text, filename } = await exportEncryptedBackup(BPW, fast)
+    expect(filename).toMatch(/^spendflow-backup-\d{4}-\d{2}-\d{2}\.sfbackup\.json$/)
+    // the file must not contain any financial text in clear
+    for (const needle of ['HDFC', 'Mart', 'Salary', 'Sample Home Loan', 'Acme Technologies']) expect(text).not.toContain(needle)
+
+    await vault.destroy()
+    await vault.initialize(PW, fast) // "a different device": fresh vault, different password
+    const opened = await openBackupFile(text, BPW)
+    expect(opened.ok).toBe(true)
+    if (!opened.ok) return
+    const preview = await applyRestore(opened.opened.backup, 'replace')
     expect(preview.tables.find((t) => t.key === 'transactions')?.added).toBe(before.data.transactions.length)
-    const after = await buildBackup()
+    const after = buildBackup()
     for (const k of ['accounts', 'transactions', 'budgets', 'loans', 'loanPayments', 'goals'] as const) {
       expect(after.data[k].slice().sort((x, y) => x.id.localeCompare(y.id))).toEqual(before.data[k].slice().sort((x, y) => x.id.localeCompare(y.id)))
     }
     expect(after.data.categories.length).toBe(before.data.categories.length)
   })
+
   it('merge never overwrites existing records and skips id collisions', async () => {
     const { a } = await seedBasic()
-    const snap = await buildBackup()
+    const snap = buildBackup()
     await accounts.update(a.id, { name: 'HDFC Renamed' })
-    const p = await previewRestore(snap, 'merge')
+    const p = previewRestore(snap, 'merge')
     expect(p.totalSkipped).toBe(snap.data.accounts.length + snap.data.transactions.length + snap.data.categories.length)
     await applyRestore(snap, 'merge')
     expect((await db.accounts.get(a.id))?.name).toBe('HDFC Renamed') // not silently overwritten
     expect(await db.transactions.count()).toBe(3) // not duplicated
   })
+
   it('merge adds only the missing records', async () => {
     await seedBasic()
-    const snap = await buildBackup()
+    const snap = buildBackup()
     const extra = (await db.transactions.where('type').equals('expense').first())!
     await db.transactions.delete(extra.id)
     await applyRestore(snap, 'merge')
     expect(await db.transactions.count()).toBe(3)
   })
-  it('rejects malformed, foreign, newer-version and inconsistent files with clear errors', async () => {
-    expect(parseBackup('not json')).toMatchObject({ ok: false })
-    expect(parseBackup('{"hello":1}')).toMatchObject({ ok: false, errors: [expect.stringMatching(/not a SpendFlow/)] })
-    expect(parseBackup('{"app":"spendflow","schemaVersion":99,"data":{}}')).toMatchObject({ ok: false, errors: [expect.stringMatching(/newer version/)] })
+
+  it('public header reveals no financial data and no counts', async () => {
     await seedBasic()
-    const snap = await buildBackup()
+    const { text } = await exportEncryptedBackup(BPW, fast)
+    const stage = inspectBackupFile(text)
+    expect(stage.ok && stage.kind === 'encrypted').toBe(true)
+    const keys = Object.keys(JSON.parse(text)).sort()
+    expect(keys).toEqual(['appSchemaVersion', 'cipher', 'ciphertext', 'createdAt', 'format', 'formatVersion', 'iv', 'kdf'])
+    expect(text).not.toMatch(/accounts|transactions|amount|merchant/)
+  })
+
+  it('wrong password, tampered ciphertext, tampered header all fail with the same generic message', async () => {
+    await seedBasic()
+    const { text } = await exportEncryptedBackup(BPW, fast)
+    const wrong = await openBackupFile(text, 'not the right password at all 1!')
+    expect(wrong).toMatchObject({ ok: false, errors: [expect.stringMatching(/password is wrong, or the file was modified/)] })
+
+    const env = JSON.parse(text)
+    const flip = (b64: string) => {
+      const bytes = Buffer.from(b64, 'base64')
+      bytes[Math.floor(bytes.length / 2)]! ^= 0x01
+      return bytes.toString('base64')
+    }
+    const tamperedCt = await openBackupFile(JSON.stringify({ ...env, ciphertext: flip(env.ciphertext) }), BPW)
+    expect(tamperedCt.ok).toBe(false)
+    // header fields are bound into the AAD: changing the date or the app schema version breaks authentication
+    const tamperedDate = await openBackupFile(JSON.stringify({ ...env, createdAt: '2020-01-01T00:00:00.000Z' }), BPW)
+    expect(tamperedDate.ok).toBe(false)
+    const tamperedVersion = await openBackupFile(JSON.stringify({ ...env, appSchemaVersion: 2 }), BPW)
+    expect(tamperedVersion.ok).toBe(false)
+    const swappedSalt = await openBackupFile(JSON.stringify({ ...env, kdf: { ...env.kdf, salt: flip(env.kdf.salt) } }), BPW)
+    expect(swappedSalt.ok).toBe(false)
+    // and the untouched file still opens
+    expect((await openBackupFile(text, BPW)).ok).toBe(true)
+  })
+
+  it('rejects unsupported versions, malformed envelopes, foreign and oversized files clearly', async () => {
+    await seedBasic()
+    const env = JSON.parse((await exportEncryptedBackup(BPW, fast)).text)
+    expect(inspectBackupFile(JSON.stringify({ ...env, formatVersion: 2 }))).toMatchObject({ ok: false, message: expect.stringMatching(/format version 2/) })
+    expect(inspectBackupFile(JSON.stringify({ ...env, iv: 'AAAA' }))).toMatchObject({ ok: false, message: expect.stringMatching(/damaged/) })
+    expect(inspectBackupFile(JSON.stringify({ ...env, kdf: { ...env.kdf, iterations: 2_000_000_000 } }))).toMatchObject({ ok: false })
+    expect(inspectBackupFile(JSON.stringify({ ...env, kdf: { ...env.kdf, iterations: 1 } }))).toMatchObject({ ok: false })
+    expect(inspectBackupFile('not json')).toMatchObject({ ok: false, message: expect.stringMatching(/not valid JSON/) })
+    expect(inspectBackupFile('{"hello":1}')).toMatchObject({ ok: false })
+    expect(inspectBackupFile(' '.repeat(26 * 1024 * 1024))).toMatchObject({ ok: false, message: expect.stringMatching(/25 MB/) })
+  })
+
+  it('rejects a correctly encrypted backup whose CONTENT is invalid or from a newer schema', async () => {
+    await seedBasic()
+    const snap = buildBackup()
     const bad = structuredClone(snap)
-    bad.data.transactions[0].amount = -4
-    const r = parseBackup(JSON.stringify(bad))
-    expect(r.ok).toBe(false)
+    bad.data.transactions[0]!.amount = -4
+    const badFile = await encryptBackup(JSON.stringify(bad), BPW, fast)
+    expect(await openBackupFile(badFile, BPW)).toMatchObject({ ok: false })
     const orphan = structuredClone(snap)
     orphan.data.accounts = []
-    const r2 = parseBackup(JSON.stringify(orphan))
-    expect(r2).toMatchObject({ ok: false, errors: [expect.stringMatching(/reference an account/)] })
-    expect(parseBackup(JSON.stringify({ ...snap, data: { ...snap.data, transactions: [snap.data.transactions[0], snap.data.transactions[0]] } }))).toMatchObject({ ok: false })
-    await expect(db.transactions.count()).resolves.toBe(3) // failed parse changed nothing
+    expect(await openBackupFile(await encryptBackup(JSON.stringify(orphan), BPW, fast), BPW)).toMatchObject({ ok: false, errors: [expect.stringMatching(/reference an account/)] })
+    const newer = await encryptBackup(JSON.stringify({ ...snap, schemaVersion: 99 }), BPW, fast)
+    expect(await openBackupFile(newer, BPW)).toMatchObject({ ok: false, errors: [expect.stringMatching(/newer version/)] })
+    const dup = await encryptBackup(JSON.stringify({ ...snap, data: { ...snap.data, transactions: [snap.data.transactions[0], snap.data.transactions[0]] } }), BPW, fast)
+    expect(await openBackupFile(dup, BPW)).toMatchObject({ ok: false })
+    expect(await db.transactions.count()).toBe(3) // failed opens changed nothing
+  })
+
+  it('still imports an OLD unencrypted backup (and re-encrypts it into the vault)', async () => {
+    await seedBasic()
+    const legacy = JSON.stringify(buildBackup())
+    const stage = inspectBackupFile(legacy)
+    expect(stage).toMatchObject({ ok: true, kind: 'legacy-plain' })
+    await vault.destroy()
+    await vault.initialize(PW, fast)
+    const r = await openBackupFile(legacy, '')
+    expect(r.ok && r.opened.warnings.join(' ')).toMatch(/UNENCRYPTED/)
+    if (r.ok) await applyRestore(r.opened.backup, 'replace')
+    expect(await db.transactions.count()).toBe(3)
+  })
+
+  it('refuses to create a backup with a weak password', async () => {
+    await expect(exportEncryptedBackup('short', fast)).rejects.toThrow(/stronger/)
+  })
+
+  it('an interrupted replace-restore never destroys the existing vault', async () => {
+    await seedBasic()
+    const { text } = await exportEncryptedBackup(BPW, fast)
+    const opened = await openBackupFile(text, BPW)
+    if (!opened.ok) throw new Error('setup')
+    // add a record the backup does not contain, so we can tell whether the vault was replaced
+    await accounts.create({ name: 'Only In Vault', type: 'other', openingBalance: 5 })
+    const snapshotBefore = JSON.stringify((await vault._rawRows()).rows.map((r) => r.key).sort())
+
+    // (a) failure while ENCRYPTING the staged replacement
+    const enc = vi.spyOn(globalThis.crypto.subtle, 'encrypt')
+    let calls = 0
+    enc.mockImplementation(async (...args) => {
+      if (++calls === 5) throw new Error('simulated crypto failure')
+      return (Object.getPrototypeOf(globalThis.crypto.subtle).encrypt as SubtleCrypto['encrypt']).apply(globalThis.crypto.subtle, args)
+    })
+    await expect(applyRestore(opened.opened.backup, 'replace')).rejects.toThrow()
+    enc.mockRestore()
+
+    // (b) failure while WRITING the swap transaction
+    const put = vi.spyOn(vault._rawDb().records, 'bulkPut').mockRejectedValueOnce(new Error('simulated disk failure'))
+    await expect(applyRestore(opened.opened.backup, 'replace')).rejects.toThrow()
+    put.mockRestore()
+
+    // memory AND persisted storage are both exactly as before
+    expect((await db.accounts.filter((a) => a.name === 'Only In Vault').first())?.name).toBe('Only In Vault')
+    expect(JSON.stringify((await vault._rawRows()).rows.map((r) => r.key).sort())).toBe(snapshotBefore)
+    await vault.lock()
+    await vault.unlock(PW)
+    expect(await db.transactions.count()).toBe(3)
+    expect((await db.accounts.filter((a) => a.name === 'Only In Vault').first())?.name).toBe('Only In Vault')
+    // and a later restore still works
+    await applyRestore(opened.opened.backup, 'replace')
+    expect(await db.accounts.filter((a) => a.name === 'Only In Vault').first()).toBeUndefined()
   })
 })
 
@@ -267,13 +393,13 @@ describe('csv', () => {
     const prev = previewCsv(csv, { accounts: accs, categories: cats, existing: txs })
     expect(prev.fatal).toEqual([])
     expect(prev.counts).toEqual({ ok: 3, duplicate: 1, error: 5 })
-    expect(prev.rows[0].tx?.date).toBe('2025-03-10')
-    expect(prev.rows[0].tx?.amount).toBe(120050)
+    expect(prev.rows[0]!.tx?.date).toBe('2025-03-10')
+    expect(prev.rows[0]!.tx?.amount).toBe(120050)
     expect(prev.newCategories).toEqual([{ name: 'Pet care', kind: 'expense' }])
-    expect(prev.rows[2].duplicateOf).toBe('file')
-    expect(prev.rows[3].errors[0]).toMatch(/Invalid date/)
-    expect(prev.rows[5].errors[0]).toMatch(/Unknown account/)
-    expect(prev.rows[7].tx).toMatchObject({ type: 'expense', amount: 7500 })
+    expect(prev.rows[2]!.duplicateOf).toBe('file')
+    expect(prev.rows[3]!.errors[0]).toMatch(/Invalid date/)
+    expect(prev.rows[5]!.errors[0]).toMatch(/Unknown account/)
+    expect(prev.rows[7]!.tx).toMatchObject({ type: 'expense', amount: 7500 })
     const r = await applyCsvImport(prev, false)
     expect(r).toEqual({ imported: 3, categoriesCreated: 1 })
     expect((await db.categories.toArray()).some((c) => c.name === 'Pet care')).toBe(true)

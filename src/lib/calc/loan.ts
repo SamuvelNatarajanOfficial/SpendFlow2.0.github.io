@@ -126,7 +126,7 @@ export function buildSchedule(
     totalPaid,
     months: rows.length,
     neverPaysOff: neverPaysOff && !done,
-    payoffDate: done ? rows[rows.length - 1].date : undefined,
+    payoffDate: done ? rows[rows.length - 1]!.date : undefined,
   }
 }
 

@@ -75,7 +75,7 @@ export default function BudgetsPage() {
   const cmpRows = [...cmp.entries()]
     .map(([id, vals]) => ({ id, name: d.catMap.get(id)?.name ?? 'Uncategorised', vals, budget: statuses.find((s) => s.budget.categoryId === id)?.budget.amount }))
     .filter((r) => r.vals.some((v) => v > 0))
-    .sort((a, b) => b.vals[2] - a.vals[2])
+    .sort((a, b) => (b.vals[2] ?? 0) - (a.vals[2] ?? 0))
 
   const del = async (s: BudgetStatus) => {
     const name = d.catMap.get(s.budget.categoryId)?.name

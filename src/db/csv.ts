@@ -82,8 +82,9 @@ export function normalizeDate(raw: string): string | null {
   if (isValidDate(s)) return s
   const m = /^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/.exec(s) // DD/MM/YYYY (Indian convention)
   if (m) {
-    const d = makeDate(+m[3], +m[2], +m[1])
-    const [dd, mm] = [+m[1], +m[2]]
+    const [, dayS = '', monS = '', yearS = ''] = m
+    const d = makeDate(+yearS, +monS, +dayS)
+    const [dd, mm] = [+dayS, +monS]
     if (mm >= 1 && mm <= 12 && isValidDate(d) && +d.slice(8) === dd) return d
   }
   return null
@@ -99,9 +100,9 @@ const stripBom = (t: string) => (t.charCodeAt(0) === 0xfeff ? t.slice(1) : t)
 export function previewCsv(text: string, ctx: ImportContext): ImportPreview {
   const fatal: string[] = []
   const parsed = Papa.parse<Record<string, string>>(stripBom(text), { header: true, skipEmptyLines: 'greedy', transformHeader: (h) => norm(h) })
-  if (parsed.errors.some((e) => e.type === 'Delimiter' || e.type === 'Quotes')) fatal.push('The file could not be parsed as CSV: ' + parsed.errors[0].message)
+  if (parsed.errors.some((e) => e.type === 'Delimiter' || e.type === 'Quotes')) fatal.push('The file could not be parsed as CSV: ' + parsed.errors[0]?.message)
   const fields = parsed.meta.fields ?? []
-  const col = (key: string) => fields.find((f) => ALIASES[key].includes(f))
+  const col = (key: string) => fields.find((f) => ALIASES[key]?.includes(f))
   for (const req of ['date', 'amount']) if (!col(req)) fatal.push(`Missing required column "${req}". Expected headers: ${['date', 'type', 'amount', 'category', 'account'].join(', ')}.`)
   if (parsed.data.length === 0) fatal.push('The file has no data rows.')
   if (parsed.data.length > MAX_ROWS) fatal.push(`Too many rows (${parsed.data.length}). Import at most ${MAX_ROWS} rows at a time.`)
@@ -194,5 +195,5 @@ export function previewCsv(text: string, ctx: ImportContext): ImportPreview {
 }
 
 export function categoryColorFor(index: number): string {
-  return CATEGORY_COLORS[index % CATEGORY_COLORS.length]
+  return CATEGORY_COLORS[index % CATEGORY_COLORS.length] ?? '#94a3b8'
 }

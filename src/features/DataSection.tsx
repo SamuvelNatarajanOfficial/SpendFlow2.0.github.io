@@ -1,78 +1,126 @@
-import { useMemo, useRef, useState, type ChangeEvent } from 'react'
+import { useMemo, useRef, useState, type ChangeEvent, type FormEvent } from 'react'
 import { AlertTriangle, Database, Download, FlaskConical, Trash2, Upload } from 'lucide-react'
 import { useData } from '@/app/data'
-import { Badge, Notice, Section, useConfirm, useToast } from '@/components/ui'
-import { applyRestore, exportBackupJson, markBackupDone, parseBackup, previewRestore, type ParseResult, type RestoreMode, type RestorePreview } from '@/db/backup'
+import { StrengthMeter } from '@/app/VaultGate'
+import { Badge, Field, Notice, Section, useConfirm, useToast } from '@/components/ui'
+import { usePlainExport } from '@/components/usePlainExport'
+import {
+  applyRestore, exportEncryptedBackup, inspectBackupFile, markBackupDone, openBackupFile, previewRestore, type FileStage, type OpenedBackup, type RestoreMode,
+} from '@/db/backup'
 import { downloadText, previewCsv, transactionsToCsv } from '@/db/csv'
 import { applyCsvImport } from '@/db/importCsv'
-import { clearAllData, updateSettings } from '@/db/repo'
+import { clearAllData } from '@/db/repo'
 import { countSample, loadSampleData, removeSampleData } from '@/db/sample'
 import { formatDateTime } from '@/lib/dates'
 import { formatINR } from '@/lib/money'
+import { MAX_BACKUP_BYTES } from '@/vault/backupFile'
+import { assessPassword } from '@/vault/password'
 
 const readFile = (f: File) => f.text()
-const MAX_BYTES = 25 * 1024 * 1024
-
-export async function downloadBackup(): Promise<void> {
-  const { json, filename } = await exportBackupJson()
-  downloadText(filename, json, 'application/json')
-  await markBackupDone()
-}
 
 export default function DataSection() {
   const d = useData()
   const toast = useToast()
   const confirm = useConfirm()
+  const plainExport = usePlainExport()
   const last = d.settings.lastBackupAt
 
+  // ----- encrypted export -----
+  const [bpw, setBpw] = useState('')
+  const [bpw2, setBpw2] = useState('')
+  const [exporting, setExporting] = useState(false)
+  const [exportError, setExportError] = useState('')
+
+  const doExport = async (e: FormEvent) => {
+    e.preventDefault()
+    setExportError('')
+    if (!assessPassword(bpw).acceptable) return setExportError('Choose a stronger backup password (12+ characters).')
+    if (bpw !== bpw2) return setExportError('The two passwords do not match.')
+    setExporting(true)
+    try {
+      const { text, filename } = await exportEncryptedBackup(bpw)
+      downloadText(filename, text, 'application/json')
+      await markBackupDone()
+      setBpw('')
+      setBpw2('')
+      toast('Encrypted backup downloaded')
+    } catch {
+      setExportError('The backup could not be created.')
+    } finally {
+      setExporting(false)
+    }
+  }
+
   // ----- restore -----
-  const [parsed, setParsed] = useState<{ name: string; result: ParseResult } | null>(null)
+  const [file, setFile] = useState<{ name: string; text: string; stage: FileStage } | null>(null)
+  const [rpw, setRpw] = useState('')
+  const [opened, setOpened] = useState<OpenedBackup | null>(null)
+  const [openErrors, setOpenErrors] = useState<string[]>([])
+  const [opening, setOpening] = useState(false)
   const [mode, setMode] = useState<RestoreMode>('merge')
-  const [preview, setPreview] = useState<RestorePreview | null>(null)
+  const [report, setReport] = useState<string | null>(null)
   const restoreInput = useRef<HTMLInputElement>(null)
+
+  const reset = () => {
+    setFile(null)
+    setOpened(null)
+    setOpenErrors([])
+    setRpw('')
+  }
 
   const onRestoreFile = async (e: ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0]
     e.target.value = ''
     if (!f) return
-    if (f.size > MAX_BYTES) return setParsed({ name: f.name, result: { ok: false, errors: ['File is larger than 25 MB.'] } })
-    const result = parseBackup(await readFile(f))
-    setParsed({ name: f.name, result })
-    setPreview(result.ok ? await previewRestore(result.backup, mode) : null)
+    reset()
+    setReport(null)
+    if (f.size > MAX_BACKUP_BYTES) return setFile({ name: f.name, text: '', stage: { ok: false, message: 'The file is larger than 25 MB.' } })
+    const text = await readFile(f)
+    setFile({ name: f.name, text, stage: inspectBackupFile(text) })
   }
-  const changeMode = async (m: RestoreMode) => {
-    setMode(m)
-    if (parsed?.result.ok) setPreview(await previewRestore(parsed.result.backup, m))
+
+  const decrypt = async (e?: FormEvent) => {
+    e?.preventDefault()
+    if (!file) return
+    setOpening(true)
+    setOpenErrors([])
+    const r = await openBackupFile(file.text, rpw)
+    setOpening(false)
+    if (r.ok) {
+      setOpened(r.opened)
+      setRpw('')
+    } else setOpenErrors(r.errors)
   }
+
+  const preview = useMemo(() => (opened ? previewRestore(opened.backup, mode) : null), [opened, mode])
+
   const doRestore = async () => {
-    if (!parsed?.result.ok || !preview) return
-    const b = parsed.result.backup
+    if (!opened || !preview) return
     const adds = preview.tables.reduce((s, t) => s + t.added, 0)
     if (mode === 'replace') {
       const ok = await confirm({
         title: 'Replace ALL current data?',
         confirmLabel: 'Replace everything',
         requireText: 'REPLACE',
-        message: <>This deletes <strong>{preview.willDelete}</strong> existing record(s) and restores <strong>{adds}</strong> from the backup. A safety backup of your current data will be downloaded first.</>,
+        message: <>This deletes <strong>{preview.willDelete}</strong> existing record(s) and restores <strong>{adds}</strong> from the backup. Nothing is changed until the backup has been fully decrypted and validated (it has been). Make sure you have a recent encrypted backup of the current data if you might need it.</>,
       })
       if (!ok) return
-      if (preview.willDelete > 0) await downloadBackup()
     } else {
       const ok = await confirm({
         title: 'Merge backup into current data?',
         confirmLabel: 'Merge',
         danger: false,
-        message: <>{adds} new record(s) will be added. {preview.totalSkipped} record(s) already exist and will be kept <strong>unchanged</strong> (nothing is overwritten).</>,
+        message: <>{adds} new record(s) will be added. {preview.totalSkipped} record(s) already exist and are kept <strong>unchanged</strong> (nothing is overwritten).</>,
       })
       if (!ok) return
     }
     try {
-      await applyRestore(b, mode)
+      await applyRestore(opened.backup, mode)
+      setReport(mode === 'replace' ? `Restore complete: replaced the vault with ${adds} record(s).` : `Merge complete: added ${adds} record(s), kept ${preview.totalSkipped} existing.`)
       toast(mode === 'replace' ? 'Backup restored' : `Merged ${adds} record(s)`)
-      setParsed(null)
-      setPreview(null)
-    } catch (err) {
-      toast(`Restore failed: ${err instanceof Error ? err.message : err}. Your data was not changed.`, 'error')
+      reset()
+    } catch {
+      toast('Restore failed. Your existing data was not changed.', 'error')
     }
   }
 
@@ -88,7 +136,7 @@ export default function DataSection() {
     const f = e.target.files?.[0]
     e.target.value = ''
     if (!f) return
-    if (f.size > MAX_BYTES) return toast('File is larger than 25 MB', 'error')
+    if (f.size > MAX_BACKUP_BYTES) return toast('File is larger than 25 MB', 'error')
     setCsv({ name: f.name, text: await readFile(f) })
   }
   const doCsv = async () => {
@@ -129,54 +177,78 @@ export default function DataSection() {
   const clearAll = async () => {
     const ok = await confirm({
       title: 'Delete ALL data?', confirmLabel: 'Delete everything', requireText: 'DELETE',
-      message: <>This permanently erases every account, transaction, budget, loan and goal stored in this browser. It cannot be undone. <strong>Download a backup first</strong> if you might need this data.</>,
+      message: <>This permanently erases the encrypted vault, every account, transaction, budget, loan and goal, <strong>and your password</strong>. You will return to first-time setup. It cannot be undone. <strong>Download an encrypted backup first</strong> if you might need this data.</>,
     })
     if (!ok) return
     await clearAllData()
-    await updateSettings({ sampleLoaded: false, lastBackupAt: undefined })
-    toast('All data deleted')
   }
+
+  const header = file?.stage.ok && file.stage.kind === 'encrypted' ? file.stage.header : null
 
   return (
     <div className="space-y-5" id="data">
-      <Section title="Backup & recovery" id="backup" actions={<Database size={18} className="text-subtle" />}>
+      <Section title="Encrypted backup & recovery" id="backup" actions={<Database size={18} className="text-subtle" />}>
         <p className="text-sm">
           Last backup: <strong>{last ? formatDateTime(last, d.settings.timezone) : 'never'}</strong>{' '}
           {!last && d.transactions.length > 0 && <Badge tone="warn">Back up now</Badge>}
         </p>
-        <p className="mt-1 text-sm text-subtle">Your data lives only in this browser. Clearing site data, uninstalling the browser or switching devices will lose it unless you have a backup file. Store backups somewhere safe: they contain your financial records in plain text.</p>
-        <div className="mt-4 flex flex-wrap items-end gap-3">
-          <button type="button" className="btn-primary" onClick={async () => { await downloadBackup(); toast('Backup downloaded') }}><Download size={16} /> Download full backup (JSON)</button>
-          <button type="button" className="btn-secondary" onClick={() => restoreInput.current?.click()}><Upload size={16} /> Restore from backup…</button>
-          <input ref={restoreInput} type="file" accept="application/json,.json" className="sr-only" aria-label="Backup file" onChange={onRestoreFile} />
-          <div>
-            <label htmlFor="remind" className="label">Remind me every</label>
-            <select id="remind" className="input !min-h-[40px] !w-auto" value={d.settings.backupReminderDays} onChange={(e) => updateSettings({ backupReminderDays: +e.target.value })}>
-              {[1, 3, 7, 14, 30].map((n) => <option key={n} value={n}>{n} day{n > 1 ? 's' : ''}</option>)}
-            </select>
-          </div>
-        </div>
+        <p className="mt-1 text-sm text-subtle">Your data lives only in this browser. Clearing site data, uninstalling the browser or switching devices will lose it unless you have a backup. Backups are encrypted with a password you choose here (AES-256-GCM) and can be restored on any device. <strong>There is no way to recover a backup if its password is forgotten.</strong></p>
 
-        {parsed && (
-          <div className="mt-4 rounded-xl border border-line p-4" aria-live="polite" data-testid="restore-preview">
-            <p className="text-sm font-semibold">{parsed.name}</p>
-            {!parsed.result.ok ? (
-              <div className="mt-2">
-                <Notice tone="neg">This file can't be restored. Nothing was changed.</Notice>
-                <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-neg">{parsed.result.errors.map((e, i) => <li key={i}>{e}</li>)}</ul>
-              </div>
-            ) : (
-              <>
-                <p className="mt-1 text-xs text-subtle">Valid SpendFlow backup · schema v{parsed.result.backup.schemaVersion} · exported {formatDateTime(parsed.result.backup.exportedAt, d.settings.timezone)}</p>
-                {parsed.result.warnings.map((w) => <p key={w} className="mt-1 text-xs text-warn">{w}</p>)}
-                <fieldset className="mt-3">
-                  <legend className="label">How should it be applied?</legend>
-                  <div className="space-y-2 text-sm">
-                    <label className="flex items-start gap-2"><input type="radio" name="mode" className="mt-1 accent-[rgb(var(--brand))]" checked={mode === 'merge'} onChange={() => changeMode('merge')} /><span><strong>Merge</strong>: add missing records, keep everything that already exists (never overwrites).</span></label>
-                    <label className="flex items-start gap-2"><input type="radio" name="mode" className="mt-1 accent-[rgb(var(--brand))]" checked={mode === 'replace'} onChange={() => changeMode('replace')} /><span><strong>Replace</strong>: erase current data and restore exactly what is in the file.</span></label>
+        <form onSubmit={doExport} noValidate className="mt-4 max-w-md space-y-3" aria-label="Create encrypted backup">
+          <h3 className="text-sm font-bold">Create encrypted backup</h3>
+          <Field label="Backup password" id="bk-pw"><input id="bk-pw" type="password" className="input" autoComplete="new-password" value={bpw} onChange={(e) => setBpw(e.target.value)} /></Field>
+          <StrengthMeter password={bpw} />
+          <Field label="Confirm backup password" id="bk-pw2"><input id="bk-pw2" type="password" className="input" autoComplete="new-password" value={bpw2} onChange={(e) => setBpw2(e.target.value)} /></Field>
+          {exportError && <p role="alert" className="err">{exportError}</p>}
+          <button type="submit" className="btn-primary" disabled={exporting}><Download size={16} /> {exporting ? 'Encrypting…' : 'Download encrypted backup'}</button>
+        </form>
+
+        <div className="mt-6 border-t border-line pt-4">
+          <h3 className="text-sm font-bold">Restore from backup</h3>
+          <p className="mt-1 text-xs text-subtle">Nothing is changed until the file is decrypted, authenticated and validated, you review the preview, and you confirm.</p>
+          <button type="button" className="btn-secondary mt-3" onClick={() => restoreInput.current?.click()}><Upload size={16} /> Choose backup file…</button>
+          <input ref={restoreInput} type="file" accept="application/json,.json" className="sr-only" aria-label="Backup file" onChange={onRestoreFile} />
+          {report && <p role="status" className="mt-3 text-sm font-semibold text-pos">{report}</p>}
+
+          {file && (
+            <div className="mt-4 rounded-xl border border-line p-4" aria-live="polite" data-testid="restore-preview">
+              <p className="text-sm font-semibold">{file.name}</p>
+              {!file.stage.ok && (
+                <div className="mt-2">
+                  <Notice tone="neg">This file can't be restored. Nothing was changed.</Notice>
+                  <p className="mt-2 text-sm text-neg">{file.stage.message}</p>
+                </div>
+              )}
+              {file.stage.ok && !opened && (
+                <form onSubmit={decrypt} noValidate className="mt-2 max-w-sm space-y-3">
+                  {header ? (
+                    <dl className="grid grid-cols-[auto,1fr] gap-x-3 gap-y-0.5 text-xs text-subtle">
+                      <dt>Format</dt><dd>Encrypted SpendFlow backup v{header.formatVersion}</dd>
+                      <dt>Created</dt><dd>{formatDateTime(header.createdAt, d.settings.timezone)}</dd>
+                      <dt>Encryption</dt><dd>{header.cipher}, {header.kdf.name}-{header.kdf.hash} × {header.kdf.iterations.toLocaleString('en-IN')}</dd>
+                    </dl>
+                  ) : (
+                    <Notice tone="warn">This is an old <strong>unencrypted</strong> SpendFlow backup. It can still be imported; its contents will be encrypted in your vault.</Notice>
+                  )}
+                  {header && <Field label="Backup password" id="rs-pw"><input id="rs-pw" type="password" className="input" autoComplete="off" value={rpw} onChange={(e) => setRpw(e.target.value)} autoFocus /></Field>}
+                  {openErrors.length > 0 && <ul role="alert" className="list-disc space-y-1 pl-5 text-sm text-neg">{openErrors.map((e, i) => <li key={i}>{e}</li>)}</ul>}
+                  <div className="flex gap-2">
+                    <button type="submit" className="btn-primary" disabled={opening || (!!header && !rpw)}>{opening ? 'Decrypting…' : header ? 'Decrypt and preview' : 'Validate and preview'}</button>
+                    <button type="button" className="btn-secondary" onClick={reset}>Cancel</button>
                   </div>
-                </fieldset>
-                {preview && (
+                </form>
+              )}
+              {opened && preview && (
+                <>
+                  <p className="mt-1 text-xs text-subtle">Authenticated and validated · exported {formatDateTime(opened.backup.exportedAt, d.settings.timezone)}</p>
+                  {opened.warnings.map((w) => <p key={w} className="mt-1 text-xs text-warn">{w}</p>)}
+                  <fieldset className="mt-3">
+                    <legend className="label">How should it be applied?</legend>
+                    <div className="space-y-2 text-sm">
+                      <label className="flex items-start gap-2"><input type="radio" name="mode" className="mt-1 accent-[rgb(var(--brand))]" checked={mode === 'merge'} onChange={() => setMode('merge')} /><span><strong>Merge</strong>: add missing records, keep everything that already exists (never overwrites).</span></label>
+                      <label className="flex items-start gap-2"><input type="radio" name="mode" className="mt-1 accent-[rgb(var(--brand))]" checked={mode === 'replace'} onChange={() => setMode('replace')} /><span><strong>Replace</strong>: erase current data and restore exactly what is in the file.</span></label>
+                    </div>
+                  </fieldset>
                   <table className="mt-3 w-full text-sm">
                     <caption className="sr-only">Restore preview</caption>
                     <thead><tr className="text-left text-xs uppercase tracking-wide text-subtle"><th scope="col" className="py-1">Data</th><th scope="col" className="text-right">In file</th><th scope="col" className="text-right">{mode === 'merge' ? 'Will add' : 'Will restore'}</th><th scope="col" className="text-right">{mode === 'merge' ? 'Already here' : 'Will delete'}</th></tr></thead>
@@ -184,20 +256,21 @@ export default function DataSection() {
                       {preview.tables.map((t) => <tr key={t.key}><th scope="row" className="py-1 text-left font-medium capitalize">{t.key.replace(/([A-Z])/g, ' $1').toLowerCase()}</th><td className="num text-right">{t.incoming}</td><td className="num text-right font-semibold">{t.added}</td><td className="num text-right text-subtle">{mode === 'merge' ? t.skipped : t.existing}</td></tr>)}
                     </tbody>
                   </table>
-                )}
-                <div className="mt-3 flex gap-2">
-                  <button type="button" className={mode === 'replace' ? 'btn-danger' : 'btn-primary'} onClick={doRestore}>{mode === 'replace' ? 'Replace data…' : 'Merge backup…'}</button>
-                  <button type="button" className="btn-secondary" onClick={() => { setParsed(null); setPreview(null) }}>Cancel</button>
-                </div>
-              </>
-            )}
-          </div>
-        )}
+                  <div className="mt-3 flex gap-2">
+                    <button type="button" className={mode === 'replace' ? 'btn-danger' : 'btn-primary'} onClick={doRestore}>{mode === 'replace' ? 'Replace data…' : 'Merge backup…'}</button>
+                    <button type="button" className="btn-secondary" onClick={reset}>Cancel</button>
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+        </div>
       </Section>
 
       <Section title="CSV import & export">
-        <div className="flex flex-wrap gap-3">
-          <button type="button" className="btn-secondary" disabled={d.transactions.length === 0} onClick={() => downloadText('spendflow-transactions.csv', transactionsToCsv(d.transactions, d.accounts, d.categories), 'text/csv')}><Download size={16} /> Export all transactions (CSV)</button>
+        <Notice tone="warn">CSV files are <strong>not encrypted</strong>. Use them for spreadsheets or moving data from another tool; use the encrypted backup above to keep a protected copy.</Notice>
+        <div className="mt-3 flex flex-wrap gap-3">
+          <button type="button" className="btn-secondary" disabled={d.transactions.length === 0} onClick={() => plainExport('spendflow-transactions.csv', transactionsToCsv(d.transactions, d.accounts, d.categories))}><Download size={16} /> Export all transactions (unencrypted CSV)</button>
           <label className="btn-secondary cursor-pointer">
             <Upload size={16} /> Import transactions (CSV)…
             <input type="file" accept=".csv,text/csv" className="sr-only" aria-label="CSV file" onChange={onCsvFile} />
@@ -262,7 +335,7 @@ export default function DataSection() {
       </Section>
 
       <Section title="Danger zone" actions={<AlertTriangle size={18} className="text-neg" />}>
-        <p className="text-sm text-subtle">Permanently delete everything stored by SpendFlow in this browser.</p>
+        <p className="text-sm text-subtle">Permanently delete the encrypted vault, all data and the password stored in this browser.</p>
         <button type="button" className="btn-danger mt-3" onClick={clearAll}><Trash2 size={16} /> Delete all data…</button>
       </Section>
     </div>

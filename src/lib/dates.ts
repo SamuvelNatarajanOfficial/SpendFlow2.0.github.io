@@ -9,7 +9,7 @@ export function isValidDate(s: unknown): s is ISODate {
   if (typeof s !== 'string') return false
   const m = RE.exec(s)
   if (!m) return false
-  const y = +m[1], mo = +m[2], d = +m[3]
+  const y = +m[1]!, mo = +m[2]!, d = +m[3]!
   if (y < 1970 || y > 2200 || mo < 1 || mo > 12 || d < 1) return false
   return d <= daysInMonth(y, mo)
 }

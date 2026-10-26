@@ -1,7 +1,5 @@
-import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
-import { useLiveQuery } from 'dexie-react-hooks'
-import { db } from '@/db/db'
-import { ensureSeed } from '@/db/repo'
+import { createContext, useContext, useEffect, useMemo, useState, useSyncExternalStore, type ReactNode } from 'react'
+import { vault } from '@/vault/store'
 import { defaultSettings } from '@/db/defaults'
 import { todayIn } from '@/lib/dates'
 import type { Account, Budget, Category, Goal, Loan, LoanPayment, Settings, Transaction } from '@/types'
@@ -28,24 +26,12 @@ export function useData(): AppData {
   return v
 }
 
+/**
+ * Exposes the DECRYPTED in-memory records to the UI. Must only be rendered while the vault is unlocked
+ * (VaultGate guarantees this). It re-renders whenever the vault changes and renders nothing the moment it locks.
+ */
 export function DataProvider({ children }: { children: ReactNode }) {
-  const [seeded, setSeeded] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-
-  useEffect(() => {
-    ensureSeed().then(() => setSeeded(true), (e) => setError(String(e?.message ?? e)))
-    // Ask the browser not to evict our data under storage pressure (best effort).
-    navigator.storage?.persist?.().catch(() => undefined)
-  }, [])
-
-  const raw = useLiveQuery(async () => {
-    if (!seeded) return undefined
-    const [accounts, transactions, categories, budgets, loans, loanPayments, goals, settings] = await Promise.all([
-      db.accounts.toArray(), db.transactions.toArray(), db.categories.toArray(), db.budgets.toArray(),
-      db.loans.toArray(), db.loanPayments.toArray(), db.goals.toArray(), db.settings.get('app'),
-    ])
-    return { accounts, transactions, categories, budgets, loans, loanPayments, goals, settings: settings ?? defaultSettings() }
-  }, [seeded])
+  const version = useSyncExternalStore(vault.subscribe, vault.getVersion)
 
   // re-evaluate "today" when the tab regains focus (handles an app left open past midnight)
   const [tick, setTick] = useState(0)
@@ -60,37 +46,31 @@ export function DataProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const value = useMemo<AppData | null>(() => {
-    if (!raw) return null
+    if (!vault.isUnlocked()) return null
+    const s = vault.snapshot()
+    const settings = s.settings.find((x) => x.id === 'app') ?? defaultSettings()
     return {
-      ...raw,
-      today: todayIn(raw.settings.timezone),
-      accMap: new Map(raw.accounts.map((a) => [a.id, a])),
-      catMap: new Map(raw.categories.map((c) => [c.id, c])),
+      accounts: s.accounts, transactions: s.transactions, categories: s.categories, budgets: s.budgets, loans: s.loans, loanPayments: s.loanPayments, goals: s.goals,
+      settings,
+      today: todayIn(settings.timezone),
+      accMap: new Map(s.accounts.map((a) => [a.id, a])),
+      catMap: new Map(s.categories.map((c) => [c.id, c])),
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [raw, tick])
+  }, [version, tick])
 
   useEffect(() => {
     if (!value) return
     const t = value.settings.theme
     document.documentElement.setAttribute('data-theme', t)
     try {
+      // theme is a non-sensitive UI preference, kept outside the vault so the lock screen can match it
       localStorage.setItem('sf-theme', t)
     } catch {
       /* storage unavailable */
     }
   }, [value])
 
-  if (error) {
-    return (
-      <div role="alert" className="mx-auto mt-20 max-w-md p-6 text-center">
-        <h1 className="text-xl font-bold">Storage is unavailable</h1>
-        <p className="mt-2 text-sm text-subtle">
-          SpendFlow could not open the browser database ({error}). Private/incognito windows and some browser settings block IndexedDB. Open the app in a regular window and allow site data.
-        </p>
-      </div>
-    )
-  }
-  if (!value) return <div className="grid min-h-screen place-items-center text-subtle" role="status">Loading your data…</div>
+  if (!value) return null
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>
 }
