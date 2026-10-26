@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { Account, Budget, Category, Goal, Loan, LoanPayment, Transaction } from '@/types'
 import {
-  accountBalance, expenseByCategory, filterByRange, reconciliationDiff, savingsRate, sumExpense, sumIncome, totalBalance, upcomingRecurring,
+  accountBalance, expenseByCategory, filterByRange, reconciliationDiff, savingsRate, sumExpense, sumIncome, totalBalance, upcomingRecurring, listRecurring, seriesKey,
 } from './ledger'
 import { budgetStatus, budgetTotals, compareMonths, monthBudgetStatuses, spentByCategory } from './budget'
 import { balanceAt, buildSchedule, calcEmi, comparePlans, nextEmiDue, splitPayment, summariseLoans } from './loan'
@@ -69,6 +69,27 @@ describe('ledger', () => {
     )
     expect(list).toHaveLength(1)
     expect(list[0].dueDate).toBe('2025-04-11')
+  })
+})
+
+describe('recurring series', () => {
+  const mk = (date: string, extra: Partial<Transaction> = {}) => tx({ type: 'expense', amount: 50000, date, accountId: 'A', merchant: 'Gym', recurring: 'monthly', ...extra })
+  it('groups by series, uses the latest entry, and lists all (not only upcoming)', () => {
+    const all = [mk('2025-01-10'), mk('2025-02-10'), mk('2025-02-10', { merchant: 'Rent', amount: 2000000, recurring: 'yearly' }), mk('2025-02-12', { recurring: undefined })]
+    const list = listRecurring(all, new Map())
+    expect(list.map((s) => [s.title, s.dueDate, s.count])).toEqual([['Gym', '2025-03-10', 2], ['Rent', '2026-02-10', 1]])
+    expect(list[0].sourceId).toBe(all[1].id)
+    // yearly series is far away: listed, but not in the 30-day window
+    expect(upcomingRecurring(all, new Map(), '2025-03-01').map((s) => s.title)).toEqual(['Gym'])
+  })
+  it('month-end series do not drift: 31st -> 28th -> 31st', () => {
+    const list = listRecurring([mk('2025-01-31'), mk('2025-02-28')], new Map())
+    expect(list[0].dueDate).toBe('2025-03-31')
+  })
+  it('keys differ by amount, frequency and merchant (case-insensitive)', () => {
+    expect(seriesKey(mk('2025-01-01'))).toBe(seriesKey(mk('2025-02-01', { merchant: 'GYM' })))
+    expect(seriesKey(mk('2025-01-01'))).not.toBe(seriesKey(mk('2025-01-01', { amount: 1 })))
+    expect(seriesKey(mk('2025-01-01'))).not.toBe(seriesKey(mk('2025-01-01', { recurring: 'weekly' })))
   })
 })
 

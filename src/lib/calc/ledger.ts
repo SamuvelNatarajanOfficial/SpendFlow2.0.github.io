@@ -1,5 +1,5 @@
 import type { Account, Category, DateRange, Frequency, Paise, Transaction } from '@/types'
-import { addDays, addMonths, inRange, isValidDate } from '../dates'
+import { addDays, addMonths, inRange, isValidDate, makeDate, parts } from '../dates'
 
 /** Transfers between own accounts are NEVER income or expense. */
 export const isIncome = (t: Transaction) => t.type === 'income'
@@ -103,46 +103,71 @@ export function sortTx(txs: Transaction[]): Transaction[] {
   return [...txs].sort((a, b) => (a.date === b.date ? b.createdAt.localeCompare(a.createdAt) : b.date.localeCompare(a.date)))
 }
 
-export function nextOccurrence(date: string, freq: Frequency): string {
+/**
+ * Next date in a series. `anchorDay` (the largest day-of-month seen in the series) stops month-end drift:
+ * a monthly item on the 31st goes 31 Jan -> 28 Feb -> 31 Mar instead of sticking to the 28th.
+ */
+export function nextOccurrence(date: string, freq: Frequency, anchorDay?: number): string {
   if (freq === 'weekly') return addDays(date, 7)
-  if (freq === 'yearly') return addMonths(date, 12)
-  return addMonths(date, 1)
+  const next = addMonths(date, freq === 'yearly' ? 12 : 1)
+  return anchorDay ? makeDate(parts(next).y, parts(next).m, anchorDay) : next
 }
 
-export interface UpcomingBill {
+export const anchorDayOf = (dates: string[]): number => Math.max(...dates.map((d) => parts(d).d))
+
+/**
+ * A recurring "series" is every recurring transaction sharing type + category + merchant + amount + frequency.
+ * The next due date comes from the LATEST entry in the series. Loan-generated expenses and transfers are excluded
+ * (loans have their own EMI tracking).
+ */
+export const isSeriesMember = (t: Transaction) => !!t.recurring && t.type !== 'transfer' && !t.loanPaymentId
+export const seriesKey = (t: Transaction) => `${t.type}|${t.categoryId ?? ''}|${(t.merchant ?? '').toLowerCase()}|${t.amount}|${t.recurring}`
+
+export interface RecurringSeries {
   key: string
   title: string
   amount: Paise
-  dueDate: string
   type: 'income' | 'expense'
+  frequency: Frequency
+  dueDate: string
+  /** latest entry of the series (the one the next occurrence is cloned from) */
+  sourceId: string
+  accountId: string
+  count: number
 }
 
-/**
- * Upcoming recurring items. A "series" is recurring transactions sharing
- * type + category + merchant + amount; the next due date is derived from the
- * latest entry in the series. Loan-generated expenses are excluded (loans are tracked separately).
- */
-export function upcomingRecurring(txs: Transaction[], cats: Map<string, Category>, today: string, horizonDays = 30): UpcomingBill[] {
-  const latest = new Map<string, Transaction>()
+/** Every recurring series with its next due date, earliest first. */
+export function listRecurring(txs: Transaction[], cats: Map<string, Category>): RecurringSeries[] {
+  const groups = new Map<string, { latest: Transaction; count: number; anchor: number }>()
   for (const t of txs) {
-    if (!t.recurring || t.type === 'transfer' || t.loanPaymentId) continue
-    const key = `${t.type}|${t.categoryId ?? ''}|${(t.merchant ?? '').toLowerCase()}|${t.amount}|${t.recurring}`
-    const cur = latest.get(key)
-    if (!cur || t.date > cur.date) latest.set(key, t)
+    if (!isSeriesMember(t)) continue
+    const key = seriesKey(t)
+    const g = groups.get(key)
+    if (!g) groups.set(key, { latest: t, count: 1, anchor: parts(t.date).d })
+    else {
+      g.count++
+      if (t.date > g.latest.date) g.latest = t
+    }
   }
-  const horizon = addDays(today, horizonDays)
-  const out: UpcomingBill[] = []
-  for (const [key, t] of latest) {
-    const due = nextOccurrence(t.date, t.recurring!)
-    // overdue items stay visible until the next occurrence is recorded
-    if (due > horizon) continue
-    out.push({
+  return [...groups.entries()]
+    .map(([key, { latest: t, count, anchor }]) => ({
       key,
       title: t.merchant || cats.get(t.categoryId ?? '')?.name || 'Recurring',
       amount: t.amount,
-      dueDate: due,
       type: t.type as 'income' | 'expense',
-    })
-  }
-  return out.sort((a, b) => a.dueDate.localeCompare(b.dueDate))
+      frequency: t.recurring!,
+      dueDate: nextOccurrence(t.date, t.recurring!, anchor),
+      sourceId: t.id,
+      accountId: t.accountId,
+      count,
+    }))
+    .sort((a, b) => a.dueDate.localeCompare(b.dueDate) || a.title.localeCompare(b.title))
+}
+
+export type UpcomingBill = RecurringSeries
+
+/** Series due within `horizonDays`. Overdue items stay visible until the next occurrence is recorded. */
+export function upcomingRecurring(txs: Transaction[], cats: Map<string, Category>, today: string, horizonDays = 30): UpcomingBill[] {
+  const horizon = addDays(today, horizonDays)
+  return listRecurring(txs, cats).filter((s) => s.dueDate <= horizon)
 }
